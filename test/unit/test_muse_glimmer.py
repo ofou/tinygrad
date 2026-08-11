@@ -222,3 +222,60 @@ class TestQuantLinear(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+def _pack_q4k(N, K, rng):
+  nblk, nb = N * (K // 256), 144
+  raw = np.zeros(nblk * nb, dtype=np.uint8)
+  blk = raw.reshape(nblk, nb)
+  d = np.frombuffer(np.array([0.05], dtype=np.float16).tobytes(), dtype=np.uint8)
+  dm = np.frombuffer(np.array([0.01], dtype=np.float16).tobytes(), dtype=np.uint8)
+  blk[:, 0:2], blk[:, 2:4] = d, dm
+  blk[:, 4:16] = np.array([1, 2, 3, 4, 5, 6, 7, 8, 0x12, 0x34, 0x56, 0x78], dtype=np.uint8)
+  blk[:, 16:] = rng.integers(0, 255, size=(nblk, 128), dtype=np.uint8)
+  return raw
+
+def _pack_q5k(N, K, rng):
+  nblk, nb = N * (K // 256), 176
+  raw = np.zeros(nblk * nb, dtype=np.uint8)
+  blk = raw.reshape(nblk, nb)
+  d = np.frombuffer(np.array([0.05], dtype=np.float16).tobytes(), dtype=np.uint8)
+  dm = np.frombuffer(np.array([0.01], dtype=np.float16).tobytes(), dtype=np.uint8)
+  blk[:, 0:2], blk[:, 2:4] = d, dm
+  blk[:, 4:16] = np.array([1, 2, 3, 4, 5, 6, 7, 8, 0x12, 0x34, 0x56, 0x78], dtype=np.uint8)
+  blk[:, 16:] = rng.integers(0, 255, size=(nblk, 160), dtype=np.uint8)
+  return raw
+
+def _pack_q6k(N, K, rng):
+  nblk, nb = N * (K // 256), 210
+  raw = np.zeros(nblk * nb, dtype=np.uint8)
+  blk = raw.reshape(nblk, nb)
+  blk[:, :192] = rng.integers(0, 255, size=(nblk, 192), dtype=np.uint8)
+  scales = rng.integers(-8, 9, size=(nblk, 16), dtype=np.int8)
+  blk[:, 192:208] = np.frombuffer(scales.tobytes(), dtype=np.uint8).reshape(nblk, 16)
+  d = np.frombuffer(np.array([0.05], dtype=np.float16).tobytes(), dtype=np.uint8)
+  blk[:, 208:210] = d
+  return raw
+
+class TestKQuantGemv(unittest.TestCase):
+  """Decode GEMV for Q4_K/Q5_K/Q6_K vs reference dequant+matmul (no 17GB GGUF)."""
+
+  def _check(self, ggml_type, pack, N=64, K=256, decode=True):
+    rng = np.random.default_rng(0)
+    packed = Tensor(pack(N, K, rng))
+    ql = QuantLinear(K, N, ggml_type)
+    ql.qweight = packed
+    xshape = (1, 1, K) if decode else (2, K)
+    x = Tensor(rng.standard_normal(xshape).astype(np.float16))
+    y = ql(x).realize().numpy()
+    w = ggml_data_to_tensor(packed, N * K, ggml_type).reshape(N, K).cast(dtypes.float16)
+    y_ref = x.linear(w.transpose()).realize().numpy()
+    # Metal f32 accum vs f16 fused path — require high correlation, modest abs error
+    corr = float(np.corrcoef(y.reshape(-1).astype(np.float64), y_ref.reshape(-1).astype(np.float64))[0, 1])
+    self.assertGreater(corr, 0.999)
+    np.testing.assert_allclose(y, y_ref, rtol=5e-2, atol=0.25)
+
+  def test_q4k_decode_matches_dequant(self): self._check(12, _pack_q4k)
+  def test_q5k_decode_matches_dequant(self): self._check(13, _pack_q5k)
+  def test_q6k_decode_matches_dequant(self): self._check(14, _pack_q6k)
+  def test_q4k_prefill_fallback(self): self._check(12, _pack_q4k, decode=False)
+  def test_q6k_larger_blocks(self): self._check(14, _pack_q6k, N=128, K=512)

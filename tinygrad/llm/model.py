@@ -433,7 +433,7 @@ class Transformer:
     """Load a GGUF checkpoint.
 
     PACKED_QUANT=1 (default for path loads): each quant tensor is copied as a contiguous
-    uint8 buffer on device; matmul layers become QuantLinear (dequant inside the graph).
+    uint8 buffer on device; matmul layers become QuantLinear; decode on Metal uses fused k-quant GEMV (FUSED_KQUANT_GEMV=1).
     RoPE-permuted Q/K stay dense f16 after one-time dequant+permute. This beats a single
     giant lazy GGUF view for decode and avoids REALIZE=1's f16 blowup on Muse-class models.
 
