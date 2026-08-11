@@ -14,7 +14,7 @@ from tinygrad.uop.ops import UOp, Ops, KernelInfo, ProgramInfo, ParamArg, AxisTy
 _Q4_K, _Q5_K, _Q6_K = 12, 13, 14
 _QK_K = 256
 _NSG = getenv("KQUANT_NSG", 2)
-_NR0 = {_Q4_K: getenv("KQUANT_NR0_Q4", 2), _Q5_K: getenv("KQUANT_NR0_Q5", 2), _Q6_K: getenv("KQUANT_NR0_Q6", 2)}
+_NR0 = {_Q4_K: getenv("KQUANT_NR0_Q4", 2), _Q5_K: getenv("KQUANT_NR0_Q5", 1), _Q6_K: getenv("KQUANT_NR0_Q6", 2)}
 
 
 _BLOCK = {
@@ -122,6 +122,92 @@ kernel void kquant_gemv(
 }}
 """
 
+
+def _metal_src_q5(N: int, nblk: int, x_half: bool, out_half: bool) -> str:
+  """llama.cpp kernel_mul_mv_q5_K_f32_impl for contiguous decode GEMV."""
+  x_ty = "half" if x_half else "float"
+  out_ty = "half" if out_half else "float"
+  def y(e: str) -> str: return _ycast(e, x_half)
+  return f"""
+#include <metal_stdlib>
+using namespace metal;
+{_BLOCK[_Q5_K]}
+kernel void kquant_gemv(
+  device {out_ty}* data0, const device {x_ty}* data1, const device block_q5_K* data2,
+  uint3 tgpig [[threadgroup_position_in_grid]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {{
+  constexpr uint N = {N}u, nblk = {nblk}u, NSG = {_NSG}u, NR0 = {_nr0(_Q5_K)}u;
+  constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+  const short tid = tiisg / 4;
+  const short ix = tiisg % 4;
+  const short iq = tid / 4;
+  const short ir = tid % 4;
+  const short l0 = 8 * ir;
+  const short q_offset = 32 * iq + l0;
+  const short y_offset = 64 * iq + l0;
+  const uint8_t hm1 = 1u << (2 * iq);
+  const uint8_t hm2 = hm1 << 1;
+  const uint8_t hm3 = hm1 << 4;
+  const uint8_t hm4 = hm2 << 4;
+  const uint first_row = (tgpig.x * NSG + sgitg) * NR0;
+  if (first_row >= N) return;
+  float yl[16], yh[16];
+  float sumf[4] = {{0.f, 0.f, 0.f, 0.f}};
+  uint16_t sc16[4];
+  thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+  for (uint ib = ix; ib < nblk; ib += 4u) {{
+    float4 sumy = {{0.f, 0.f, 0.f, 0.f}};
+    const uint y1 = ib * 256u + y_offset;
+    for (short l = 0; l < 8; ++l) {{
+      yl[l+0] = {y('data1[y1 + l + 0]')}; sumy[0] += yl[l+0];
+      yl[l+8] = {y('data1[y1 + l + 32]')}; sumy[1] += yl[l+8];
+      yh[l+0] = {y('data1[y1 + l + 128]')}; sumy[2] += yh[l+0];
+      yh[l+8] = {y('data1[y1 + l + 160]')}; sumy[3] += yh[l+8];
+    }}
+    for (uint r = 0; r < NR0; r++) {{
+      const uint row = first_row + r;
+      if (row >= N) continue;
+      device const block_q5_K& blk = data2[row * nblk + ib];
+      device const uint8_t* q1 = blk.qs + q_offset;
+      device const uint8_t* q2 = q1 + 64;
+      device const uint8_t* qh = blk.qh + l0;
+      device const uint16_t* a = (device const uint16_t*)blk.scales + iq;
+      const float d = float(blk.d), dmin = float(blk.dmin);
+      sc16[0] = a[0] & kmask1;
+      sc16[1] = a[2] & kmask1;
+      sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+      sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+      float4 acc1 = {{0.f, 0.f, 0.f, 0.f}};
+      float4 acc2 = {{0.f, 0.f, 0.f, 0.f}};
+      for (short l = 0; l < 8; ++l) {{
+        const uint8_t h = qh[l];
+        acc1[0] += yl[l+0] * float(q1[l] & 0x0F);
+        acc1[1] += yl[l+8] * float(q1[l] & 0xF0);
+        acc1[2] += yh[l+0] * float(q2[l] & 0x0F);
+        acc1[3] += yh[l+8] * float(q2[l] & 0xF0);
+        acc2[0] += (h & hm1) ? yl[l+0] : 0.f;
+        acc2[1] += (h & hm2) ? yl[l+8] : 0.f;
+        acc2[2] += (h & hm3) ? yh[l+0] : 0.f;
+        acc2[3] += (h & hm4) ? yh[l+8] : 0.f;
+      }}
+      sumf[r] += d * (float(sc8[0]) * (acc1[0] + 16.f * acc2[0]) +
+                      float(sc8[1]) * (acc1[1] * (1.f/16.f) + 16.f * acc2[1]) +
+                      float(sc8[4]) * (acc1[2] + 16.f * acc2[2]) +
+                      float(sc8[5]) * (acc1[3] * (1.f/16.f) + 16.f * acc2[3]))
+               - dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                         sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+    }}
+  }}
+  for (uint r = 0; r < NR0; r++) {{
+    const uint row = first_row + r;
+    if (row >= N) break;
+    float t = simd_sum(sumf[r]);
+    if (tiisg == 0) data0[row] = {out_ty}(t);
+  }}
+}}
+"""
 
 def _metal_src_q6(N: int, nblk: int, x_half: bool, out_half: bool) -> str:
   """llama.cpp kernel_mul_mv_q6_K_f32_impl for contiguous decode GEMV."""
@@ -278,6 +364,7 @@ kernel void kquant_gemv(
 
 def _metal_src(ggml_type: int, N: int, nblk: int, x_half: bool, out_half: bool) -> str:
   if ggml_type == _Q4_K: return _metal_src_q4(N, nblk, x_half, out_half)
+  if ggml_type == _Q5_K: return _metal_src_q5(N, nblk, x_half, out_half)
   if ggml_type == _Q6_K: return _metal_src_q6(N, nblk, x_half, out_half)
   return _metal_src_generic(ggml_type, N, nblk, x_half, out_half)
 
