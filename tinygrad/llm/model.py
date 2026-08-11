@@ -126,6 +126,7 @@ class TransformerConfig:
   post_norm: bool = False  # post_attention_norm + post_ffw_norm (Muse)
   post_norm_eps: float = 1e-8
   embd_norm: bool = False  # weightless RMSNorm after token embedding (Muse)
+  rope_interleaved_qk: bool = False  # KEEP_QK_QUANT: permute Q/K acts not weights
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -233,6 +234,14 @@ class TransformerBlock(FFNBlock):
 
     # Muse: RoPE on local/SWA layers only; global layers are NoPE
     if self.config.use_rope:
+      # ggml NORM stores Q/K interleaved; apply_rope wants half-split. When Q/K stay
+      # quantized (KEEP_QK_QUANT), convert on the activation (cheap) instead of dequant+permute weights.
+      if getattr(self.config, "rope_interleaved_qk", False):
+        def _interleaved_to_half(t: Tensor) -> Tensor:
+          rope, rest = t[..., :self.config.rope_dim], t[..., self.config.rope_dim:]
+          rope = rope.rearrange("b h t (half two) -> b h t (two half)", two=2)
+          return rope.cat(rest, dim=-1) if resolve(rest.shape[-1] != 0) else rope
+        q, k = _interleaved_to_half(q), _interleaved_to_half(k)
       q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
       k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
@@ -433,7 +442,7 @@ class Transformer:
     """Load a GGUF checkpoint.
 
     PACKED_QUANT=1 (default for path loads): each quant tensor is copied as a contiguous
-    uint8 buffer on device; matmul layers become QuantLinear; decode on Metal uses fused k-quant GEMV (FUSED_KQUANT_GEMV=1).
+    uint8 buffer on device; matmul layers become QuantLinear; Metal decode uses fused k-quant GEMV (FUSED_KQUANT_GEMV=1).
     RoPE-permuted Q/K stay dense f16 after one-time dequant+permute. This beats a single
     giant lazy GGUF view for decode and avoids REALIZE=1's f16 blowup on Muse-class models.
 
@@ -489,28 +498,32 @@ class Transformer:
 
     # Permute RoPE weights from interleaved (ggml NORM) to half-split layout used by apply_rope.
     # Muse-Glimmer GGUFs store interleaved Q/K (conversion unpermutes HF rotate_half).
+    # KEEP_QK_QUANT=1: leave Q/K packed (QuantLinear); convert interleaved→half-split on activations.
     rope_arches = ('llama', 'muse-glimmer')
+    keep_qk_quant = bool(getenv("KEEP_QK_QUANT", 1)) and packed_quant
     dense_f16: set[str] = set()
-    for name in list(state_dict):
-      if arch == 'kimi-linear': continue
-      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch in rope_arches or kv_lora_rank):
-        w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
-        prefix = head_dim-rope_dim
-        state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
-        dense_f16.add(name)
-      elif arch in rope_arches and 'attn_k.weight' in name:
-        w = state_dict[name].reshape(n_kv_heads, state_dict[name].shape[0]//n_kv_heads, -1)
-        state_dict[name] = w.rearrange("n (h two) d -> n (two h) d", two=2).reshape(-1, w.shape[-1])
-        dense_f16.add(name)
-      elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
-        state_dict[name] = state_dict[name][:kv_lora_rank].cat(state_dict[name][kv_lora_rank:].rearrange("(h two) d -> (two h) d", two=2), dim=0)
-        dense_f16.add(name)
-    # One-time materialize of rope-permuted Q/K (small vs FFN) so QuantLinear isn't fighting rearranges.
-    for name in dense_f16:
-      w = state_dict[name]
-      if getenv("HALF", 1): w = w.cast(dtypes.float16)
-      # Must realize: otherwise the dequant+permute graph is re-fused into every decode step.
-      state_dict[name] = w.contiguous().realize()
+    if not keep_qk_quant:
+      for name in list(state_dict):
+        if arch == 'kimi-linear': continue
+        if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch in rope_arches or kv_lora_rank):
+          w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
+          prefix = head_dim-rope_dim
+          state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
+          dense_f16.add(name)
+        elif arch in rope_arches and 'attn_k.weight' in name:
+          w = state_dict[name].reshape(n_kv_heads, state_dict[name].shape[0]//n_kv_heads, -1)
+          state_dict[name] = w.rearrange("n (h two) d -> n (two h) d", two=2).reshape(-1, w.shape[-1])
+          dense_f16.add(name)
+        elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
+          state_dict[name] = state_dict[name][:kv_lora_rank].cat(state_dict[name][kv_lora_rank:].rearrange("(h two) d -> (two h) d", two=2), dim=0)
+          dense_f16.add(name)
+      # One-time materialize of rope-permuted Q/K so QuantLinear isn't fighting rearranges.
+      # NOTE: on Muse this is NOT small — attn_q alone is ~2.8GB f16 and re-read every decode token.
+      for name in dense_f16:
+        w = state_dict[name]
+        if getenv("HALF", 1): w = w.cast(dtypes.float16)
+        # Must realize: otherwise the dequant+permute graph is re-fused into every decode step.
+        state_dict[name] = w.contiguous().realize()
 
     config = TransformerConfig(
       num_blocks=kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0), dim=kv[f'{arch}.embedding_length'],
@@ -542,7 +555,8 @@ class Transformer:
       final_logit_softcapping=float(kv.get(f'{arch}.final_logit_softcapping', 0.0) or 0.0),
       logit_scale=float(kv.get(f'{arch}.logit_scale', 1.0) or 1.0),
       post_norm='blk.0.post_attention_norm.weight' in state_dict,
-      embd_norm=arch == 'muse-glimmer')
+      embd_norm=arch == 'muse-glimmer',
+      rope_interleaved_qk=keep_qk_quant)
     model = Transformer(config)
 
     # Upgrade quant matmul weights to QuantLinear (packed qweight Parameter).
@@ -551,6 +565,8 @@ class Transformer:
       "attn_v", "attn_output", "attn_gate", "output", "ssm_out", "attn_qkv",
       "ssm_beta", "ssm_alpha", "ssm_g_a", "ssm_g_b", "ssm_f_a", "ssm_f_b",
     }
+    if keep_qk_quant:
+      _QUANT_LEAVES = _QUANT_LEAVES | {"attn_q", "attn_k", "attn_q_b"}
     if packed_quant:
       for name, (raw, typ, shape) in packed.items():
         if not name.endswith(".weight") or not is_ggml_quant(typ): continue

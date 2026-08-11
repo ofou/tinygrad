@@ -1,3 +1,4 @@
+import os
 import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes
@@ -220,9 +221,6 @@ class TestQuantLinear(unittest.TestCase):
     self.assertEqual(model.blk[0].ffn_down.qweight.numel(), packed.numel())
 
 
-if __name__ == "__main__":
-  unittest.main()
-
 def _pack_q4k(N, K, rng):
   nblk, nb = N * (K // 256), 144
   raw = np.zeros(nblk * nb, dtype=np.uint8)
@@ -279,3 +277,51 @@ class TestKQuantGemv(unittest.TestCase):
   def test_q6k_decode_matches_dequant(self): self._check(14, _pack_q6k)
   def test_q4k_prefill_fallback(self): self._check(12, _pack_q4k, decode=False)
   def test_q6k_larger_blocks(self): self._check(14, _pack_q6k, N=128, K=512)
+
+
+class TestQuantGeneral(unittest.TestCase):
+  """Non-K quants used by CLI models (Q4_0 / Q8_0) through QuantLinear fuse path."""
+
+  def _check(self, ggml_type, N=32, K=64):
+    # pack via ggml roundtrip: random f16 weight -> not available; use zeros + dequant path shape
+    ql = QuantLinear(K, N, ggml_type)
+    rng = np.random.default_rng(0)
+    ql.qweight = Tensor(rng.integers(0, 255, size=ql.qweight.numel(), dtype=np.uint8))
+    x = Tensor(rng.standard_normal((1, K)).astype(np.float16))
+    y = ql(x).realize().numpy()
+    w = ggml_data_to_tensor(ql.qweight, N * K, ggml_type).reshape(N, K).cast(dtypes.float16)
+    y_ref = x.linear(w.transpose()).realize().numpy()
+    np.testing.assert_allclose(y, y_ref, rtol=5e-2, atol=0.25)
+
+  def test_q4_0(self): self._check(2)
+  def test_q8_0(self): self._check(8)
+  def test_q4_1(self): self._check(3)
+  def test_q5_0(self): self._check(6)
+  def test_q5_1(self): self._check(7)
+
+
+class TestQuantGemvLower(unittest.TestCase):
+  """Isolated fuse graph lowers to the same Metal kernel as custom_kernel."""
+
+  @unittest.skipUnless(__import__("tinygrad", fromlist=["Device"]).Device.DEFAULT.upper().startswith("METAL"), "Metal only")
+  def test_lower_matches_hand_q4k(self):
+    from tinygrad.helpers import getenv
+    from tinygrad.codegen import to_program_cache
+    N, K, gt = 64, 256, 12
+    rng = np.random.default_rng(0)
+    packed = Tensor(_pack_q4k(N, K, rng))
+    x = Tensor(rng.standard_normal((1, K)).astype(np.float16))
+    def run(fused):
+      os.environ["FUSED_KQUANT_GEMV"] = str(int(fused))
+      os.environ["QUANT_GEMV_LOWER"] = "1"
+      os.environ["HALF"] = "1"
+      os.environ["KQUANT_X_HALF"] = "1"
+      getenv.cache_clear()
+      to_program_cache.clear()
+      ql = QuantLinear(K, N, gt)
+      ql.qweight = packed
+      return ql(x).realize().numpy().astype(np.float32)
+    np.testing.assert_array_equal(run(False), run(True))
+
+if __name__ == "__main__":
+  unittest.main()

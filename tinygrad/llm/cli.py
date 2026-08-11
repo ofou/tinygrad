@@ -11,9 +11,6 @@ if TYPE_CHECKING:
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
                bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
-    # llama4 (Muse-Glimmer / Llama 4) uses GPT-4o-style BPE pre-tokenizer in llama.cpp;
-    # tinygrad's SimpleTokenizer currently shares the llama3 unicode-category regex, which is
-    # a close practical alias for local inference. Chat formatting still prefers tokenizer.chat_template.
     preset = {"qwen35":"qwen2","qwen35moe":"qwen2","llama4":"llama3"}.get(preset, preset)
     if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4"):
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
@@ -94,6 +91,7 @@ models = {
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
   "moonlight": "https://huggingface.co/gabriellarson/Moonlight-16B-A3B-Instruct-GGUF/resolve/main/Moonlight-16B-A3B-Instruct-Q4_K_M.gguf",
   "glm-4.7-flash": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf",
+  "muse-glimmer:30b": "https://huggingface.co/lmstudio-community/Muse-Glimmer-30B-GGUF/resolve/main/muse-glimmer-30B-kquant-17gb.gguf",
 }
 
 class FallbackTemplate:

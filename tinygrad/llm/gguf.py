@@ -54,8 +54,8 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       q = q_to_uint8(blocks[:,qh_off+4:], 4).bitcast(dtypes.int8) + qh * 16
       return q * d + (blocks[:,2:4].bitcast(dtypes.float16).cast(dtypes.float32) if ggml_type == 7 else -16 * d)
     if ggml_type == 8: return blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32) * blocks[:,2:].bitcast(dtypes.int8)
-     # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
-     # Q5_K: 256 elements per 176-byte block (d:2, dmin:2, scales:12, qh:32, qs:128)
+    # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
+    # Q5_K: 256 elements per 176-byte block (d:2, dmin:2, scales:12, qh:32, qs:128)
     if ggml_type in (12, 13):
       d, dmin = (blocks[:,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
       s = blocks[:,4:16]  # 12 bytes: 6-bit scales[0-3], 6-bit mins[0-3], high bits[4-7]
@@ -155,7 +155,7 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
 
-def _quant_nbytes(n_elems: int, ggml_type: int) -> int:
+def quant_nbytes(n_elems: int, ggml_type: int) -> int:
   if (dtype := _GGML_NATIVE.get(ggml_type)) is not None: return n_elems * dtype.itemsize
   if (ne_nb := _GGML_QUANT.get(ggml_type)) is None: raise ValueError(f"GGML type '{ggml_type}' is not supported!")
   ne, nb = ne_nb
@@ -190,7 +190,7 @@ def gguf_load_packed(fn: str|pathlib.Path) -> tuple[dict, dict[str, tuple[Tensor
   out: dict[str, tuple[Tensor, int, tuple[int, ...]]] = {}
   def _load_one(disk_t: Tensor, start: int, name: str, dims: tuple, typ: int, off: int):
     shape = tuple(reversed(dims))
-    nbytes = _quant_nbytes(prod(dims), typ)
+    nbytes = quant_nbytes(prod(dims), typ)
     raw = disk_t[start + off:start + off + nbytes].to(None).contiguous().realize()
     if typ in _GGML_NATIVE:
       out[name] = (raw.bitcast(_GGML_NATIVE[typ]).reshape(shape), typ, shape)

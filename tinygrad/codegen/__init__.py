@@ -467,6 +467,8 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   if ast.op is Ops.PROGRAM: prg = ast
   elif ast.op is Ops.SINK:
     assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to to_program"
+    from tinygrad.codegen.quant_gemv import try_packed_kquant_gemv
+    if (qprg := try_packed_kquant_gemv(ast, renderer)) is not None: return qprg
     full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None)
     prog_info = ProgramInfo.from_sink(full_sink, renderer.target)
     # instruction selection
