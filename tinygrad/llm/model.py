@@ -26,6 +26,24 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
+def attention_mask(T:int|UOp, start_pos:int|UOp, dtype, sliding_window:int=0) -> Tensor|None:
+  """Causal mask, optionally with llama.cpp LLAMA_SWA_TYPE_STANDARD windowing.
+
+  Masks key positions where key_pos > query_pos (causal) or query_pos - key_pos >= sliding_window.
+  Returns None when no masking is required (decode step with full context inside the window).
+  """
+  kv_len = start_pos + T
+  need_causal = resolve(T != 1)
+  need_swa = sliding_window > 0 and resolve(kv_len > sliding_window)
+  if not need_causal and not need_swa: return None
+  mask = Tensor.zeros((1, 1, T, kv_len), dtype=dtype, buffer=False)
+  if need_causal:
+    mask = mask + Tensor.full((1, 1, T, kv_len), float("-inf"), dtype=dtype, buffer=False).triu(start_pos+1)
+  if need_swa:
+    # -inf where col <= row + (start_pos - sliding_window)  <=>  query_pos - key_pos >= window
+    mask = mask + Tensor.full((1, 1, T, kv_len), float("-inf"), dtype=dtype, buffer=False).tril(start_pos - sliding_window)
+  return mask
+
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
   vals = Tensor.arange(n).reshape(1,1,n).cast(x.dtype).expand(x.shape)
@@ -65,7 +83,8 @@ class TransformerConfig:
   kv_lora_rank: int = 0
   shared_expert_dim: int = 0
   ssm_layers: tuple[bool, ...] = ()
-  attn_output_gate: bool = False
+  attn_output_gate: bool = False  # qwen-style: gate folded into doubled q_proj
+  attn_gate: bool = False         # muse/afmoe-style: separate blk.N.attn_gate before o_proj
   ssm: SSMConfig|None = None
   shared_expert_gate: bool = True
   leading_dense_blocks: int = 0
@@ -73,6 +92,15 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+  # Muse-Glimmer / hybrid attention
+  sliding_window: int = 0
+  sliding_window_pattern: tuple[bool, ...] = ()  # True = local/SWA layer
+  use_rope: bool = True  # False = NoPE (Muse global layers)
+  final_logit_softcapping: float = 0.0
+  logit_scale: float = 1.0
+  post_norm: bool = False  # post_attention_norm + post_ffw_norm (Muse)
+  post_norm_eps: float = 1e-8
+  embd_norm: bool = False  # weightless RMSNorm after token embedding (Muse)
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -81,6 +109,10 @@ class FFNBlock:
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
     self.ffn_norm    = nn.RMSNorm(config.dim, config.norm_eps)
+    # Muse-Glimmer dual post-norms (GGUF: post_attention_norm / post_ffw_norm)
+    if config.post_norm:
+      self.post_attention_norm = nn.RMSNorm(config.dim, config.post_norm_eps)
+      self.post_ffw_norm = nn.RMSNorm(config.dim, config.post_norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
@@ -134,8 +166,12 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      attn = self._attention(self.attn_norm(x), start_pos)
+      if hasattr(self, "post_attention_norm"): attn = self.post_attention_norm(attn)
+      h = x + attn
+      ffn = self._feed_forward(self.ffn_norm(h))
+      if hasattr(self, "post_ffw_norm"): ffn = self.post_ffw_norm(ffn)
+      return (h + ffn).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -150,6 +186,9 @@ class TransformerBlock(FFNBlock):
     self.attn_k      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_v      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=False)
+    # Muse/afmoe: separate attention output gate (sigmoid) applied before o_proj
+    if config.attn_gate:
+      self.attn_gate = Linear(config.dim, config.head_dim * config.n_heads, bias=False)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
@@ -157,6 +196,8 @@ class TransformerBlock(FFNBlock):
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
+    # Muse/afmoe separate gate from pre-attn hidden; qwen folds gate into doubled q_proj
+    muse_gate = self.attn_gate(x).sigmoid() if hasattr(self, "attn_gate") and self.config.attn_gate else None
     if self.config.attn_output_gate:
       qg = q.reshape(B, T, self.config.n_heads, 2, self.config.head_dim)
       q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, self.config.n_heads * self.config.head_dim)
@@ -165,25 +206,23 @@ class TransformerBlock(FFNBlock):
     v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
-    k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
+    # Muse: RoPE on local/SWA layers only; global layers are NoPE
+    if self.config.use_rope:
+      q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
+      k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     assigned_kv = Tensor(self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).uop)))
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
     v = assigned_kv[1, :, :, 0:start_pos+T, :]
 
-    #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
-    #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
-    #v = self.cache_kv[1, :, :, 0:start_pos+T, :]
-
-    # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
-    # TODO: this if statement should be removed and it shouldn't generate extra kernels
-    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
-      if resolve(T != 1) else None
+    # NOTE: causal_lower_right (+ optional SWA). not the causal_upper_left from is_causal=True
+    mask = attention_mask(T, start_pos, x.dtype, self.config.sliding_window)
     attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-    return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+    if muse_gate is not None: attn = attn * muse_gate
+    elif self.config.attn_output_gate: attn = attn * gate.sigmoid()
+    return self.attn_output(attn)
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
@@ -310,13 +349,24 @@ class Transformer:
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(dense_config if i < config.leading_dense_blocks else config, config.ssm)
-                               if config.ssm and config.ssm_layers[i] else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+    self.blk:list[FFNBlock] = []
+    for i in range(config.num_blocks):
+      base = dense_config if i < config.leading_dense_blocks else config
+      # Muse hybrid attention: local layers get SWA+RoPE, global layers get full attn+NoPE
+      if config.sliding_window_pattern:
+        is_local = bool(config.sliding_window_pattern[i])
+        base = replace(base, use_rope=is_local, sliding_window=config.sliding_window if is_local else 0)
+      if config.ssm and config.ssm_layers[i]:
+        self.blk.append(GatedDeltaNetBlock(base, config.ssm))
+      else:
+        self.blk.append(block_cls(base))
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
+    self.embd_norm = nn.RMSNorm(config.dim, config.norm_eps, elementwise_affine=False) if config.embd_norm else None
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
+    self.logit_scale = config.logit_scale
+    self.final_logit_softcapping = config.final_logit_softcapping
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
@@ -325,8 +375,13 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
+    if self.embd_norm is not None: x = self.embd_norm(x)
     for block in self.blk: x = block(x, start_pos)
     logits = self.output(self.output_norm(x))[:, -1, :]
+    # Muse: output multiplier then optional tanh softcap (llama.cpp muse-glimmer.cpp)
+    if self.logit_scale != 1.0: logits = logits * self.logit_scale
+    if self.final_logit_softcapping:
+      logits = (logits / self.final_logit_softcapping).tanh() * self.final_logit_softcapping
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
@@ -336,10 +391,16 @@ class Transformer:
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
+    """Load a GGUF checkpoint.
+
+    Prefer REALIZE=0 (default): quantized weights stay as lazy dequant views over the
+    GGUF byte buffer. REALIZE=1 contiguous-cast+realize materializes every parameter in
+    f16 and will OOM / thrash on large models (e.g. Muse 28B ~56GB f16).
+    """
     # TODO: remove the need for copy to default device
     kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
 
-    # all state items should be float16, not float32
+    # Prefer keeping the GGUF quantized buffer + lazy dequant. HALF only casts the view dtype.
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
@@ -372,14 +433,16 @@ class Transformer:
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
     rope_dim = kv.get(f'{arch}.rope.dimension_count', head_dim)
 
-    # Permute RoPE weights from interleaved to half-split layout.
+    # Permute RoPE weights from interleaved (ggml NORM) to half-split layout used by apply_rope.
+    # Muse-Glimmer GGUFs store interleaved Q/K (conversion unpermutes HF rotate_half).
+    rope_arches = ('llama', 'muse-glimmer')
     for name in state_dict:
       if arch == 'kimi-linear': continue
-      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
+      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch in rope_arches or kv_lora_rank):
         w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
         prefix = head_dim-rope_dim
         state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
-      elif arch == 'llama' and 'attn_k.weight' in name:
+      elif arch in rope_arches and 'attn_k.weight' in name:
         w = state_dict[name].reshape(n_kv_heads, state_dict[name].shape[0]//n_kv_heads, -1)
         state_dict[name] = w.rearrange("n (h two) d -> n (two h) d", two=2).reshape(-1, w.shape[-1])
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
@@ -407,12 +470,26 @@ class Transformer:
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
       ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
-      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
+      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
+      attn_gate='blk.0.attn_gate.weight' in state_dict,
+      sliding_window=int(kv.get(f'{arch}.attention.sliding_window', 0) or 0),
+      sliding_window_pattern=tuple(bool(x) for x in kv.get(f'{arch}.attention.sliding_window_pattern', ())),
+      final_logit_softcapping=float(kv.get(f'{arch}.final_logit_softcapping', 0.0) or 0.0),
+      logit_scale=float(kv.get(f'{arch}.logit_scale', 1.0) or 1.0),
+      post_norm='blk.0.post_attention_norm.weight' in state_dict,
+      embd_norm=arch == 'muse-glimmer')
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
-    # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
+    # Prefer lazy dequant over the GGUF buffer. REALIZE=1 materializes full f16 params (avoid for large models).
     if realize:
-      for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
+      params = nn.state.get_parameters(model)
+      nparams = sum(s.numel() for s in params)
+      # ~2B+ f16 params is already multi-GB; Muse 28B would be ~56GB realized.
+      if nparams > 2_000_000_000:
+        raise RuntimeError(
+          f"REFUSING REALIZE=1 for {nparams:,} params (~{nparams*2/1e9:.0f}GB f16). "
+          "Keep lazy dequant over the GGUF buffer (REALIZE=0, default).")
+      for s in params: s.replace(s.contiguous())
       Tensor.realize(*params)
     return model, kv
 
