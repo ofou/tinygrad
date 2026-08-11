@@ -154,6 +154,56 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
+
+def _quant_nbytes(n_elems: int, ggml_type: int) -> int:
+  if (dtype := _GGML_NATIVE.get(ggml_type)) is not None: return n_elems * dtype.itemsize
+  if (ne_nb := _GGML_QUANT.get(ggml_type)) is None: raise ValueError(f"GGML type '{ggml_type}' is not supported!")
+  ne, nb = ne_nb
+  if n_elems % ne != 0: raise ValueError(f"{n_elems} not divisible by quant block size {ne}")
+  return (n_elems // ne) * nb
+
+def _gguf_parse_header_file(path: pathlib.Path) -> tuple[dict, list, int]:
+  """Parse GGUF kv + tensor infos with file I/O (does not realize the weight blob)."""
+  with open(path, "rb") as fp:
+    r = io.BufferedReader(fp, 1_000_000)
+    magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
+    if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
+    kv_data = {}
+    for _ in range(n_kv):
+      k, typ = read_str(r), read_int32(r)
+      kv_data[k] = readers[typ](r)
+    t_infos = [(read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r))
+               for _ in range(n_tensors)]
+    alignment, pos = kv_data.get("general.alignment", 32), r.tell()
+    data_start = round_up(pos, alignment)
+  return kv_data, t_infos, data_start
+
+def gguf_load_packed(fn: str|pathlib.Path) -> tuple[dict, dict[str, tuple[Tensor, int, tuple[int, ...]]]]:
+  """Load GGUF tensor-by-tensor without realizing the whole file on device.
+
+  Returns (kv_data, packed) where packed[name] = (tensor, ggml_type, nn_shape).
+  Native tensors are bitcast+reshaped; quant tensors are contiguous uint8 packed bytes.
+  """
+  path = pathlib.Path(fn)
+  kv, infos, data_start = _gguf_parse_header_file(path)
+  disk = Tensor(path)
+  out: dict[str, tuple[Tensor, int, tuple[int, ...]]] = {}
+  def _load_one(disk_t: Tensor, start: int, name: str, dims: tuple, typ: int, off: int):
+    shape = tuple(reversed(dims))
+    nbytes = _quant_nbytes(prod(dims), typ)
+    raw = disk_t[start + off:start + off + nbytes].to(None).contiguous().realize()
+    if typ in _GGML_NATIVE:
+      out[name] = (raw.bitcast(_GGML_NATIVE[typ]).reshape(shape), typ, shape)
+    else:
+      out[name] = (raw, typ, shape)
+  for name, dims, typ, off in infos: _load_one(disk, data_start, name, dims, typ, off)
+  if kv.get("split.count", 1) > 1:
+    for pp in _gguf_split_paths(path, kv)[1:]:
+      _, infos2, data_start2 = _gguf_parse_header_file(pp)
+      disk2 = Tensor(pp)
+      for name, dims, typ, off in infos2: _load_one(disk2, data_start2, name, dims, typ, off)
+  return kv, out
+
 def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.

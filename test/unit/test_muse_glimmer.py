@@ -3,7 +3,10 @@ import numpy as np
 from tinygrad import Tensor, dtypes
 from tinygrad.llm.model import (
   Transformer, TransformerBlock, TransformerConfig, attention_mask,
+  iswa_cache_len, iswa_attention_mask,
 )
+from tinygrad.llm.quant import QuantLinear, replace_linear_with_quant
+from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.cli import SimpleTokenizer
 
 def _cfg(**kwargs):
@@ -135,6 +138,87 @@ class TestRealizeGuard(unittest.TestCase):
         raise RuntimeError(
           f"REFUSING REALIZE=1 for {nparams:,} params (~{nparams*2/1e9:.0f}GB f16). "
           "Keep lazy dequant over the GGUF buffer (REALIZE=0, default).")
+
+
+class TestISWA(unittest.TestCase):
+  def test_iswa_cache_len_pads_to_256(self):
+    self.assertEqual(iswa_cache_len(131072, 2048), 2048)
+    self.assertEqual(iswa_cache_len(1000, 2048), 1000)
+    self.assertEqual(iswa_cache_len(4096, 2000), 2048)  # pad 2000 -> 2048
+    self.assertEqual(iswa_cache_len(8192, 0), 8192)
+
+  def test_local_layers_allocate_window_not_max_context(self):
+    pattern = tuple(i % 4 != 3 for i in range(8))
+    # window 512 pads to 512; max_context 4096 -> local KV is 512 not 4096
+    cfg = _cfg(num_blocks=8, sliding_window=512, sliding_window_pattern=pattern,
+               attn_gate=True, max_context=4096)
+    model = Transformer(cfg)
+    x = Tensor.randn(1, 2, cfg.dim)
+    for i, blk in enumerate(model.blk):
+      blk._init_state(x)
+      if pattern[i]:
+        self.assertTrue(blk.iswa)
+        self.assertEqual(blk.kv_cache_len, 512)
+        self.assertEqual(blk.cache_kv.shape[3], 512)
+      else:
+        self.assertFalse(blk.iswa)
+        self.assertEqual(blk.cache_kv.shape[3], 4096)
+
+  def test_iswa_mask_pads_and_causal(self):
+    # kv_cache_len=8, start_pos=2, T=2 -> 4 valid keys right-aligned, pad_end=4
+    mask = iswa_attention_mask(2, 2, 8, dtypes.float32, sliding_window=8).numpy()[0, 0]
+    self.assertTrue(np.all(np.isneginf(mask[:, :4])))
+    # row0 abs_q=2; abs_key(c)=c-4; causal masks abs_k>abs_q => c>6
+    self.assertTrue(np.isneginf(mask[0, 7]))
+    self.assertEqual(mask[0, 6], 0)
+    # padding is column-only: row1 still sees first valid key at col4
+    self.assertEqual(mask[1, 4], 0)
+
+  def test_iswa_forward_decode_and_prefill(self):
+    pattern = (True, True, True, False)
+    # window pads to 256; max_context 512 forces compact ISWA shift path on local layers
+    cfg = _cfg(num_blocks=4, sliding_window=4, sliding_window_pattern=pattern,
+               attn_gate=True, post_norm=True, embd_norm=True, max_context=512)
+    model = Transformer(cfg)
+    tok = Tensor([[1, 2, 3, 4]], dtype=dtypes.int32)
+    out = model.forward(tok, 0, Tensor([0.0])).realize()
+    self.assertEqual(out.shape, (1, 1))
+    self.assertTrue(model.blk[0].iswa)
+    self.assertEqual(model.blk[0].kv_cache_len, 256)
+    self.assertEqual(model.blk[0].cache_kv.shape[3], 256)
+    self.assertFalse(model.blk[3].iswa)
+    self.assertEqual(model.blk[3].cache_kv.shape[3], 512)
+    for sp in range(4, 12):
+      out = model.forward(Tensor([[int(out.item())]], dtype=dtypes.int32), sp, Tensor([0.0])).realize()
+      self.assertEqual(out.shape, (1, 1))
+
+class TestQuantLinear(unittest.TestCase):
+  def test_q8_0_matches_dequant_linear(self):
+    in_f, out_f = 32, 64
+    rng = np.random.default_rng(0)
+    blocks = []
+    for _ in range(out_f * in_f // 32):
+      scale = np.float16(rng.uniform(0.01, 0.1))
+      qs = rng.integers(-127, 127, size=32, dtype=np.int8)
+      blocks.append(np.frombuffer(scale.tobytes() + qs.tobytes(), dtype=np.uint8))
+    packed = Tensor(np.concatenate(blocks))
+    ql = QuantLinear(in_f, out_f, ggml_type=8)
+    ql.qweight = packed
+    x = Tensor(rng.standard_normal((2, in_f)).astype(np.float32))
+    y = ql(x).realize().numpy()
+    w = ggml_data_to_tensor(packed, out_f * in_f, 8).reshape(out_f, in_f).cast(dtypes.float16)
+    y_ref = x.linear(w.transpose()).realize().numpy()
+    np.testing.assert_allclose(y, y_ref, rtol=1e-3, atol=1e-3)
+
+  def test_replace_linear_installs_qweight(self):
+    cfg = _cfg(num_blocks=1, max_context=8)
+    model = Transformer(cfg)
+    n = cfg.dim * cfg.hidden_dim
+    packed = Tensor.zeros((n // 32) * 34, dtype=dtypes.uint8)
+    replace_linear_with_quant(model, "blk.0.ffn_down", packed, 8, (cfg.dim, cfg.hidden_dim))
+    self.assertIsInstance(model.blk[0].ffn_down, QuantLinear)
+    self.assertEqual(model.blk[0].ffn_down.qweight.numel(), packed.numel())
+
 
 if __name__ == "__main__":
   unittest.main()
