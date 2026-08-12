@@ -32,6 +32,10 @@ def normalize_messages(messages:list[dict]) -> None:
         try: tc["function"]["arguments"] = json.loads(args)
         except json.JSONDecodeError: pass
 
+def _hold_partial(buf:str, tags:tuple[str, ...]) -> int:
+  # length of a suffix of buf that is a proper prefix of any tag (0 if none)
+  return max((i for tag in tags for i in range(1, min(len(buf), len(tag))+1) if tag.startswith(buf[-i:])), default=0)
+
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
   def __init__(self, reasoning:bool=False):
@@ -42,7 +46,7 @@ class StreamRouter:
     if tag in self.buf:
       before, self.buf = self.buf.split(tag, 1)
       return before, True
-    hold = max((i for i in range(1, min(len(self.buf), len(tag))+1) if tag.startswith(self.buf[-i:])), default=0) if not final else 0
+    hold = _hold_partial(self.buf, (tag,)) if not final else 0
     emit, self.buf = self.buf[:len(self.buf)-hold], self.buf[len(self.buf)-hold:]
     return emit, False
   def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
@@ -60,6 +64,38 @@ class StreamRouter:
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
 
+class MuseStreamRouter:
+  # harmony/muse channels after prompt `<|start|>assistant`: ` to=recv<|message|>body<|eom|>` (+ optional `<|start|>assistant`)
+  _END = ("<|eom|>", "<|eot|>")
+  def __init__(self):
+    self.buf, self.mode, self.recipient = "", "header", "user"
+  def _field(self) -> str|None:
+    return {"self":"reasoning_content", "user":"content"}.get(self.recipient)
+  def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
+    self.buf += piece
+    while True:
+      if self.mode == "header":
+        if "<|message|>" in self.buf:
+          header, self.buf = self.buf.split("<|message|>", 1)
+          self.recipient = m.group(1) if (m := re.search(r"to=(\S+)", header)) else "user"
+          self.mode = "body"
+          continue
+        if not final: return  # entire header held until <|message|>
+        self.buf = ""
+        return
+      # body: stream until <|eom|> / <|eot|>, holding back partial end tags
+      end = min(((self.buf.index(t), t) for t in self._END if t in self.buf), default=None)
+      if end is not None:
+        i, t = end
+        body, self.buf = self.buf[:i], self.buf[i+len(t):]
+        if body and (f := self._field()): yield f, body
+        self.mode = "header"
+        continue
+      hold = 0 if final else _hold_partial(self.buf, self._END)
+      emit, self.buf = self.buf[:len(self.buf)-hold], self.buf[len(self.buf)-hold:]
+      if emit and (f := self._field()): yield f, emit
+      return
+
 class Handler(HTTPRequestHandler):
   server: LLMServer
   def log_request(self, code='-', size='-'): pass
@@ -67,7 +103,7 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False):
+                reasoning:bool=False, muse:bool=False):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -78,7 +114,7 @@ class Handler(HTTPRequestHandler):
     finish_reason = "stop"
     st = pt = time.perf_counter()
     dec = tok.stream_decoder()
-    router = StreamRouter(reasoning)
+    router: StreamRouter|MuseStreamRouter = MuseStreamRouter() if muse else StreamRouter(reasoning)
     def log_stats(interrupted:bool=False):
       et = time.perf_counter()
       total = f"total:{et-st:6.2f}s"
@@ -139,9 +175,11 @@ class Handler(HTTPRequestHandler):
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      rendered_r = rendered.rstrip()
+      muse = rendered_r.endswith("<|start|>assistant")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
-                              reasoning=rendered.rstrip().endswith("<think>"))
+                              reasoning=(not muse) and rendered_r.endswith("<think>"), muse=muse)
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
