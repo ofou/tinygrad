@@ -310,10 +310,14 @@ class RandMixin(OpMixin):
     print(q.scaled_dot_product_attention(k, v).numpy())
     ```
     """
-    # GQA: https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+    # GQA: expand (view) instead of repeat_interleave (copy). Muse 32h/2kv → 16× save.
     if enable_gqa:
-      key = key.repeat_interleave(int(self.shape[-3] // key.shape[-3]), dim=-3)
-      value = value.repeat_interleave(int(self.shape[-3] // value.shape[-3]), dim=-3)
+      def _gqa_expand(t):
+        rep = int(self.shape[-3] // t.shape[-3])
+        if rep == 1: return t
+        # (..., kv, S, D) -> (..., kv, 1, S, D) -> expand -> (..., kv*rep, S, D)
+        return t.unsqueeze(-3).expand(*t.shape[:-3], t.shape[-3], rep, *t.shape[-2:]).reshape(*t.shape[:-3], t.shape[-3]*rep, *t.shape[-2:])
+      key, value = _gqa_expand(key), _gqa_expand(value)
 
     q = self
     qk = q.matmul(key.transpose(-2,-1), dtype=least_upper_dtype(q.dtype, key.dtype, dtypes.float32)) / math.sqrt(q.shape[-1])
