@@ -7,6 +7,7 @@ from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, Context, 
 from tinygrad.llm.model import Transformer
 if TYPE_CHECKING:
   import jinja2
+  from tinygrad.llm.dflash import DFlashDraft
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
@@ -137,7 +138,35 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--dflash", nargs='?', const=True, default=None, metavar="PATH",
+                      help="DFlash draft GGUF for speculative decoding (env DFLASH_GGUF)")
+  parser.add_argument("--n_draft", type=int, default=None, help="DFlash draft tokens per step (default: block_size-1)")
+  parser.add_argument("--dflash-only", action="store_true",
+                      help="Load embd/head + DFlash draft only (no Muse layers); run synthetic smoke")
   args = parser.parse_args()
+
+  # resolve optional DFlash path (shared by full + draft-only paths)
+  dflash_path = args.dflash
+  if dflash_path is True: dflash_path = getenv("DFLASH_GGUF", "") or None
+  elif dflash_path is None: dflash_path = getenv("DFLASH_GGUF", "") or None
+  dflash: DFlashDraft | None = None
+
+  # draft-only: TargetHead (embd/output) + DFlash — skip 52 Muse layers
+  if args.dflash_only:
+    from tinygrad.llm.dflash import TargetHead, DFlashDraft, smoke_dflash_only
+    if not dflash_path: raise SystemExit("--dflash-only needs --dflash PATH (or DFLASH_GGUF)")
+    t_load0 = time.perf_counter()
+    head, kv = TargetHead.from_gguf(fetch(models.get(args.model, args.model)))
+    dflash = DFlashDraft.from_gguf(dflash_path, head, args.max_context)
+    t_load = (time.perf_counter() - t_load0) * 1e3
+    print(f"dflash-only target head from {args.model!r}: dim={head.dim} vocab={head.vocab_size} "
+          f"on {nn.state.get_parameters(head)[0].device}")
+    print(f"dflash draft: {dflash_path} blocks={dflash.config.num_blocks} "
+          f"block_size={dflash.config.block_size} target_layers={dflash.config.target_layers}")
+    print(f"[dflash-only] load {t_load:.1f} ms")
+    with Context(DEBUG=max(DEBUG.value, 1)):
+      smoke_dflash_only(dflash, T=16, n_draft=args.n_draft)
+    return
 
   # load the model
   model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
@@ -145,6 +174,13 @@ def main():
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "
         f"max context {args.max_context} on {nn.state.get_parameters(model)[0].device}")
+
+  # optional DFlash draft
+  if dflash_path:
+    from tinygrad.llm.dflash import DFlashDraft
+    dflash = DFlashDraft.from_gguf(dflash_path, model, args.max_context)
+    print(f"dflash draft: {dflash_path} blocks={dflash.config.num_blocks} "
+          f"block_size={dflash.config.block_size} target_layers={dflash.config.target_layers}")
 
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
@@ -172,7 +208,15 @@ def main():
 
   # do benchmark
   if args.benchmark is not None:
-    gen = model.generate(toks:=[tok.bos_id or 0])
+    # DFlash needs real context; BOS-only prefixes yield ~0 accept and look like a correctness bug.
+    if dflash is not None:
+      seed = "def fibonacci(n):\n    if n < 2:\n        return n\n    "
+      toks = tok.encode(seed)
+      if tok.bos_id is not None and (not toks or toks[0] != tok.bos_id):
+        toks = [tok.bos_id] + toks
+    else:
+      toks = [tok.bos_id or 0]
+    gen = model.generate(toks, dflash=dflash, n_draft=args.n_draft)
     for i in range(args.benchmark):
       profile_marker(f"decode @ {i}")
       GlobalCounters.reset()
@@ -192,7 +236,7 @@ def main():
     except EOFError: break
     ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
     reply, dec = "", tok.stream_decoder()
-    for next_id in model.generate(ids):
+    for next_id in model.generate(ids, dflash=dflash, n_draft=args.n_draft):
       if tok.is_end(next_id):
         sys.stdout.write(dec() + "\n\n")
         break

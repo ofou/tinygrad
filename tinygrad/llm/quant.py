@@ -1,10 +1,4 @@
-"""Packed GGUF quantized linears.
-
-mul_mat is ggml-shaped (y = x @ W.T). On Metal decode, k-quant GEMVs lower in
-do_to_program (QUANT_GEMV_LOWER) from the fused dequant+linear sink. Sibling
-QuantLinears are split with .contiguous() so each sink stays single-uchar.
-FUSED_KQUANT_GEMV=1 keeps Tensor.custom_kernel as an escape hatch.
-"""
+"""Packed GGUF QuantLinear; Metal T<=16 lowers via QUANT_GEMV_LOWER (3-buf uchar+REDUCE)."""
 from __future__ import annotations
 import functools
 from tinygrad.tensor import Tensor
@@ -24,19 +18,34 @@ def dequant_weight(qweight: Tensor, out_features: int, in_features: int, ggml_ty
   w = ggml_data_to_tensor(qweight, out_features * in_features, ggml_type).reshape(out_features, in_features)
   return w.cast(dtypes.float16) if getenv("HALF", 1) else w
 
+def _batch_rows(x: Tensor) -> int | None:
+  """Leading batch product (T for decode/verify). None if unresolved."""
+  try:
+    t = prod(x.shape[:-1])
+    if not isinstance(t, int): t = int(resolve(t))
+    return t if t >= 1 else None
+  except Exception: return None
+
 def _is_decode_row(x: Tensor) -> bool:
-  try: return bool(resolve(prod(x.shape[:-1]) == 1))
-  except Exception: return False
+  return _batch_rows(x) == 1
 
 def _device_is_metal(x: Tensor) -> bool:
   dev = x.device if isinstance(x.device, str) else (x.device[0] if isinstance(x.device, tuple) else Device.DEFAULT)
   return str(dev).upper().startswith("METAL")
 
-def _metal_kquant_decode(x: Tensor, ggml_type: int, in_features: int) -> bool:
+def _metal_kquant_packed(x: Tensor, ggml_type: int, in_features: int, *, max_t: int | None = None) -> bool:
+  """Packed Metal path for T=1 decode and small T>1 (DFlash verify)."""
+  if max_t is None: max_t = getenv("QUANT_GEMV_MAX_T", 16)
+  t = _batch_rows(x)
   return (ggml_type in _KQUANT_TYPES and in_features % _QK_K == 0
-          and _is_decode_row(x) and _device_is_metal(x))
+          and t is not None and t <= max_t and _device_is_metal(x))
+
+# Back-compat alias used by older call sites / tests.
+def _metal_kquant_decode(x: Tensor, ggml_type: int, in_features: int) -> bool:
+  return _metal_kquant_packed(x, ggml_type, in_features)
 
 def _mul_mat_q_metal(qweight: Tensor, x: Tensor, n: int, k: int, ggml_type: int) -> Tensor:
+  """Deprecated FUSED_KQUANT_GEMV=1 escape hatch. Prefer QUANT_GEMV_LOWER (~13.9 tok/s)."""
   from tinygrad.codegen.quant_gemv import program_uop
   if k % _QK_K: raise ValueError(f"K={k} not divisible by {_QK_K}")
   x_flat = x.reshape(-1, k).contiguous()
@@ -50,14 +59,16 @@ def _mul_mat_q_metal(qweight: Tensor, x: Tensor, n: int, k: int, ggml_type: int)
   return out.reshape(*x.shape[:-1], n)
 
 def mul_mat(qweight: Tensor, x: Tensor, *, ggml_type: int, out_features: int, in_features: int) -> Tensor:
-  # Escape hatch: hand-rolled Metal mul_mv via custom_kernel (default off).
-  if getenv("FUSED_KQUANT_GEMV", 0) and _metal_kquant_decode(x, ggml_type, in_features):
+  # Deprecated hatch (default 0, T=1 only). Leave off unless bisecting a lowering regression.
+  if getenv("FUSED_KQUANT_GEMV", 0) and _metal_kquant_packed(x, ggml_type, in_features, max_t=1):
     return _mul_mat_q_metal(qweight, x, out_features, in_features, ggml_type)
+  # QUANT_GEMV_CONTIG default 1: bufferize x/y so QUANT_GEMV_LOWER matches for T<=MAX_T.
+  # Set CONTIG=0 with QUANT_GEMV_SCHED_BARRIER=1 to A/B the schedule path.
+  lower = _metal_kquant_packed(x, ggml_type, in_features) and getenv("QUANT_GEMV_LOWER", 1)
+  contig = lower and getenv("QUANT_GEMV_CONTIG", 1)
+  if contig: x = x.contiguous()
   y = x.linear(dequant_weight(qweight, out_features, in_features, ggml_type).transpose())
-  # Prevent Muse sibling QuantLinears from fusing into multi-uchar sinks that
-  # QUANT_GEMV_LOWER cannot match; each decode GEMV stays a single-uchar kernel.
-  if _metal_kquant_decode(x, ggml_type, in_features) and getenv("QUANT_GEMV_LOWER", 1):
-    return y.contiguous()
+  if contig: return y.contiguous()
   return y
 
 class QuantLinear:

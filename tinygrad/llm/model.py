@@ -69,6 +69,20 @@ def iswa_attention_mask(T:int|UOp, start_pos:int|UOp, kv_cache_len:int, dtype, s
     mask = mask + Tensor.full((1, 1, T, kv_cache_len), float("-inf"), dtype=dtype, buffer=False).tril(kv_cache_len - T - sliding_window)
   return mask
 
+
+def parse_sliding_window_pattern(raw, n_layers: int) -> tuple[bool, ...]:
+  """GGUF `.attention.sliding_window_pattern`: bool array OR scalar period (llama.cpp set_swa_pattern).
+
+  Scalar N means (N-1) local/SWA layers then 1 global, repeating — e.g. 4 → T,T,T,F,T,T,T,F,...
+  """
+  if raw is None or raw == () or raw == []:
+    return ()
+  if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+    period = int(raw)
+    if period <= 0: raise ValueError(f"invalid sliding_window_pattern period {period}")
+    return tuple((i % period) != (period - 1) for i in range(n_layers))
+  return tuple(bool(x) for x in raw)
+
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
   vals = Tensor.arange(n).reshape(1,1,n).cast(x.dtype).expand(x.shape)
@@ -421,19 +435,75 @@ class Transformer:
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
-    if self.embd_norm is not None: x = self.embd_norm(x)
-    for block in self.blk: x = block(x, start_pos)
-    logits = self.output(self.output_norm(x))[:, -1, :]
-    # Muse: output multiplier then optional tanh softcap (llama.cpp muse-glimmer.cpp)
+  def _apply_logits(self, logits:Tensor) -> Tensor:
     if self.logit_scale != 1.0: logits = logits * self.logit_scale
     if self.final_logit_softcapping:
       logits = (logits / self.final_logit_softcapping).tanh() * self.final_logit_softcapping
+    return logits
+
+  def _embed_blocks(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    x = self.token_embd(tokens).float()                   # (B, T, D)
+    if self.embd_norm is not None: x = self.embd_norm(x)
+    capture = getattr(self, "_dflash_capture", None)
+    if capture:
+      # Store layer taps as graph tensors — no mid-forward realize (host sync).
+      feats = getattr(self, "_dflash_features", None)
+      if feats is None:
+        self._dflash_features: dict[int, Tensor] = {}
+        feats = self._dflash_features
+      capture_post = bool(__import__("os").environ.get("DFLASH_CAPTURE_POST", "0") not in ("0",""))
+      for i, block in enumerate(self.blk):
+        if (not capture_post) and i in capture: feats[i] = x.contiguous()
+        x = block(x, start_pos)
+        if capture_post and i in capture: feats[i] = x.contiguous()
+      return x
+    for block in self.blk: x = block(x, start_pos)
+    return x
+
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    x = self._embed_blocks(tokens, start_pos)
+    logits = self._apply_logits(self.output(self.output_norm(x)))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
+  def forward_next_ids(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    """Argmax next-token id for every position [B, T] (DFlash verify)."""
+    x = self._embed_blocks(tokens, start_pos)
+    logits = self._apply_logits(self.output(self.output_norm(x)))
+    return (logits / temperature.maximum(1e-12)).argmax(-1)
+
+  def forward_verify(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor):
+    """Jitable T-batch verify: pred ids + layer features as real outputs (no capture side-channel).
+
+    Returns (preds[B,T], *feats) where feats follow `_dflash_verify_layers` order.
+    Features are graph tensors (contiguous); TinyJit realizes them with preds in one shot.
+    """
+    layers = tuple(getattr(self, "_dflash_verify_layers", ()) or ())
+    layer_set = frozenset(layers)
+    capture_post = bool(__import__("os").environ.get("DFLASH_CAPTURE_POST", "0") not in ("0",""))
+    x = self.token_embd(tokens).float()
+    if self.embd_norm is not None: x = self.embd_norm(x)
+    feats_by_i: dict[int, Tensor] = {}
+    for i, block in enumerate(self.blk):
+      if (not capture_post) and i in layer_set: feats_by_i[i] = x.contiguous()
+      x = block(x, start_pos)
+      if capture_post and i in layer_set: feats_by_i[i] = x.contiguous()
+    logits = self._apply_logits(self.output(self.output_norm(x)))
+    preds = (logits / temperature.maximum(1e-12)).argmax(-1)
+    return (preds, *[feats_by_i[i] for i in layers])
+
+  def ensure_verify_jit(self, target_layers: tuple[int, ...] | list[int]):
+    """Bind extract layers and (re)build TinyJit for forward_verify."""
+    layers = tuple(int(i) for i in target_layers)
+    if getattr(self, "_dflash_verify_layers", None) != layers or not hasattr(self, "verify_jit"):
+      self._dflash_verify_layers = layers
+      self.verify_jit = TinyJit(self.forward_verify)
+    return self.verify_jit
+
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    # DFlash capture is a Python side-channel — skip TinyJit while enabled (zero cost when off).
+    if getattr(self, "_dflash_capture", None):
+      return self.forward(tokens.contiguous(), start_pos, temperature)
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
@@ -443,7 +513,8 @@ class Transformer:
 
     PACKED_QUANT=1 (default for path loads): each quant tensor is copied as a contiguous
     uint8 buffer on device; matmul layers become QuantLinear. Metal decode GEMVs lower
-    via QUANT_GEMV_LOWER (default on); FUSED_KQUANT_GEMV=1 is an optional custom_kernel escape hatch.
+    via QUANT_GEMV_LOWER (default on). FUSED_KQUANT_GEMV defaults off and is a
+    deprecated custom_kernel escape hatch (keep while zero-ritual stays ~13.9 tok/s).
     RoPE-permuted Q/K stay dense f16 after one-time dequant+permute. This beats a single
     giant lazy GGUF view for decode and avoids REALIZE=1's f16 blowup on Muse-class models.
 
@@ -552,7 +623,7 @@ class Transformer:
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
       attn_gate='blk.0.attn_gate.weight' in state_dict,
       sliding_window=int(kv.get(f'{arch}.attention.sliding_window', 0) or 0),
-      sliding_window_pattern=tuple(bool(x) for x in kv.get(f'{arch}.attention.sliding_window_pattern', ())),
+      sliding_window_pattern=parse_sliding_window_pattern(kv.get(f'{arch}.attention.sliding_window_pattern', ()), kv[f'{arch}.block_count']),
       final_logit_softcapping=float(kv.get(f'{arch}.final_logit_softcapping', 0.0) or 0.0),
       logit_scale=float(kv.get(f'{arch}.logit_scale', 1.0) or 1.0),
       post_norm='blk.0.post_attention_norm.weight' in state_dict,
@@ -599,7 +670,12 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0,
+               dflash=None, n_draft:int|None=None):
+    if dflash is not None:
+      yield from self._generate_dflash(tokens, chunk_size=chunk_size, temperature=temperature,
+                                       dflash=dflash, n_draft=n_draft)
+      return
     if self.has_recurrent_block: chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -621,3 +697,153 @@ class Transformer:
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
+
+  def _generate_dflash(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0,
+                       dflash=None, n_draft:int|None=None):
+    """Speculative decode via DFlash draft (llama.cpp draft_dflash)."""
+    from tinygrad.llm.dflash import enable_dflash_capture, disable_dflash_capture, take_dflash_features, accept_prefix
+    if self.has_recurrent_block: chunk_size = 1
+    temp = Tensor([temperature])
+    n_draft = dflash.config.n_draft_max if n_draft is None else min(int(n_draft), dflash.config.n_draft_max)
+    v_start_pos = UOp.variable("dflash_start_pos", 0, self.max_context-1)
+    verify_layers = tuple(dflash.config.target_layers)
+    verify_jit = self.ensure_verify_jit(verify_layers)
+
+    def _reset_kv():
+      # Keep target KV buffers alive — verify TinyJit captured those allocations.
+      # Prefill from pos 0 overwrites slots; do not delattr cache_kv/cache_k.
+      for b in self.blk:
+        for attr in ("conv_state", "recurrent_state"):
+          if hasattr(b, attr): delattr(b, attr)
+      if hasattr(dflash, "reset_cache"): dflash.reset_cache()
+      else:
+        for b in dflash.blk:
+          if hasattr(b, "cache_kv"): delattr(b, "cache_kv")
+      self._cached_tokens = []
+
+    def _prefill_range(toks:list[int], start:int=0):
+      """Prefill toks[start:] with capture+inject; return last-position sample Tensor."""
+      out = None
+      pos = start
+      while pos < len(toks):
+        n_toks = min(chunk_size, len(toks) - pos)
+        chunk = Tensor([toks[pos:pos+n_toks]], dtype="int32")
+        out = self.forward(chunk, pos, temp).realize()
+        feats = take_dflash_features(self)
+        if feats:
+          Tensor.realize(*feats.values())
+          dflash.process(feats, pos)
+        pos += n_toks
+      return out
+
+    def _run_verify(batch:list[int], sp_int:int):
+      """Jitted verify → (pred_list, feats dict). Capture must be off.
+
+      Packed QUANT_GEMV_LOWER handles small T>1 (QUANT_GEMV_MAX_T, default 16) without
+      full-dequant. Default: parallel T-batch verify. Set DFLASH_VERIFY_PARALLEL=0 for
+      sequential T=1 GEMV fallback (concat features along T).
+      """
+      parallel = bool(__import__("os").environ.get("DFLASH_VERIFY_PARALLEL", "1") not in ("0", ""))
+      if parallel or len(batch) == 1:
+        sp = v_start_pos.bind(sp_int)
+        ret = verify_jit(Tensor([batch], dtype="int32").contiguous(), sp, temp)
+        preds, feat_tensors = ret[0], ret[1:]
+        pred_list = [int(x) for x in preds.numpy().reshape(-1).tolist()]
+        feats = {layer: feat_tensors[i] for i, layer in enumerate(verify_layers)}
+        return pred_list, feats
+
+      # Sequential T=1: each step hits decode GEMV + verify_jit replay.
+      seq_preds: list[int] = []
+      feat_lists: dict[int, list] = {layer: [] for layer in verify_layers}
+      for i, tok in enumerate(batch):
+        sp = v_start_pos.bind(sp_int + i)
+        ret = verify_jit(Tensor([[tok]], dtype="int32").contiguous(), sp, temp)
+        seq_preds.append(int(ret[0].item()))
+        for j, layer in enumerate(verify_layers):
+          feat_lists[layer].append(ret[1 + j])
+      feats = {}
+      for layer, ts in feat_lists.items():
+        feats[layer] = ts[0] if len(ts) == 1 else ts[0].cat(*ts[1:], dim=1)
+      return seq_preds, feats
+
+    from tinygrad.helpers import DEBUG
+    import time as _time
+    enable_dflash_capture(self, verify_layers)
+    try:
+      start_pos = self.get_start_pos(tokens)
+      if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]):
+        Tensor.realize(*resets)
+      t0 = _time.perf_counter()
+      out = _prefill_range(tokens, start_pos)
+      if DEBUG >= 1: print(f"[dflash] prefill {len(tokens)-start_pos} toks in {(_time.perf_counter()-t0)*1e3:.1f} ms")
+      tokens.append(int(out.item()))
+      self._cached_tokens = tokens[:-1]
+      yield tokens[-1]
+
+      # Steady-state verify uses TinyJit + feature outputs — capture side-channel off.
+      disable_dflash_capture(self)
+      step = 0
+      while len(tokens) < self.max_context:
+        id_last = tokens[-1]
+        t1 = _time.perf_counter()
+        draft = dflash.draft_block(id_last, len(tokens) - 1, n_draft=n_draft, temperature=temperature)
+        t_draft = (_time.perf_counter()-t1)*1e3
+        if not draft:
+          enable_dflash_capture(self, verify_layers)
+          out = self.forward(Tensor([[id_last]], dtype="int32"), len(tokens) - 1, temp).realize()
+          feats = take_dflash_features(self)
+          disable_dflash_capture(self)
+          if feats:
+            Tensor.realize(*feats.values())
+            dflash.process(feats, len(tokens) - 1)
+          tokens.append(int(out.item()))
+          self._cached_tokens = tokens[:-1]
+          yield tokens[-1]
+          continue
+
+        # Verify batch = [id_last, *draft]; preds[i] = next-id after batch[i]
+        batch = [id_last] + draft
+        sp = len(tokens) - 1
+        t2 = _time.perf_counter()
+        pred_list, feats = _run_verify(batch, sp)
+        t_verify = (_time.perf_counter()-t2)*1e3
+        n_acc = accept_prefix(draft, pred_list[:len(draft)])
+        if DEBUG >= 2:
+          print(f"[dflash] draft_ids={draft[:8]} pred_ids={pred_list[:8]} feat_keys={sorted(feats)}")
+        bonus = pred_list[n_acc]
+
+        # Commit KV / re-prefill BEFORE yielding so short --benchmark runs still see phase prints.
+        if n_acc == len(draft):
+          t3 = _time.perf_counter()
+          if feats:
+            dflash.process(feats, sp)
+          t_inject = (_time.perf_counter()-t3)*1e3
+          t_reprefill = 0.0
+        else:
+          # Build committed prefix (accepted draft + prior); bonus not yet in KV as input.
+          committed = tokens + draft[:n_acc]
+          t3 = _time.perf_counter()
+          _reset_kv()
+          enable_dflash_capture(self, verify_layers)
+          _prefill_range(committed, 0)
+          disable_dflash_capture(self)
+          t_reprefill = (_time.perf_counter()-t3)*1e3
+          t_inject = 0.0
+
+        if DEBUG >= 1:
+          print(f"[dflash] step={step} draft={len(draft)} acc={n_acc}/{len(draft)} "
+                f"draft_ms={t_draft:.1f} verify_ms={t_verify:.1f} "
+                f"inject_ms={t_inject:.1f} reprefill_ms={t_reprefill:.1f}")
+
+        for i in range(n_acc):
+          tokens.append(draft[i])
+          yield draft[i]
+        tokens.append(bonus)
+        self._cached_tokens = tokens[:-1]
+        if n_acc != len(draft):
+          # reprefill already wrote committed; keep cache aligned with tokens[:-1]
+          self._cached_tokens = tokens[:-1]
+        yield bonus
+        step += 1
+    finally:
+      disable_dflash_capture(self)

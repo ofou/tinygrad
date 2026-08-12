@@ -178,17 +178,20 @@ def _gguf_parse_header_file(path: pathlib.Path) -> tuple[dict, list, int]:
     data_start = round_up(pos, alignment)
   return kv_data, t_infos, data_start
 
-def gguf_load_packed(fn: str|pathlib.Path) -> tuple[dict, dict[str, tuple[Tensor, int, tuple[int, ...]]]]:
+def gguf_load_packed(fn: str|pathlib.Path, names: set[str]|frozenset[str]|None=None
+                     ) -> tuple[dict, dict[str, tuple[Tensor, int, tuple[int, ...]]]]:
   """Load GGUF tensor-by-tensor without realizing the whole file on device.
 
   Returns (kv_data, packed) where packed[name] = (tensor, ggml_type, nn_shape).
   Native tensors are bitcast+reshaped; quant tensors are contiguous uint8 packed bytes.
+  If names is set, only those tensors are loaded (header/kv still fully parsed).
   """
   path = pathlib.Path(fn)
   kv, infos, data_start = _gguf_parse_header_file(path)
   disk = Tensor(path)
   out: dict[str, tuple[Tensor, int, tuple[int, ...]]] = {}
   def _load_one(disk_t: Tensor, start: int, name: str, dims: tuple, typ: int, off: int):
+    if names is not None and name not in names: return
     shape = tuple(reversed(dims))
     nbytes = quant_nbytes(prod(dims), typ)
     raw = disk_t[start + off:start + off + nbytes].to(None).contiguous().realize()

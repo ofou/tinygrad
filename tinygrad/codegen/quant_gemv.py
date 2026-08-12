@@ -1,7 +1,14 @@
-"""Packed ggml k-quant GEMV for Metal (llama.cpp mul_mv).
+"""Packed ggml k-quant GEMV/GEMM for Metal (llama.cpp mul_mv).
 
 Primary entry: try_packed_kquant_gemv from do_to_program (QUANT_GEMV_LOWER).
-Optional: program_uop via Tensor.custom_kernel when FUSED_KQUANT_GEMV=1.
+T=1 decode and default T>1: Y=T launch (best full-model on M4 Pro).
+QUANT_GEMV_WS=1: weight-stationary T>1 — one weight load/row, accumulate all T
+in registers (microbench T=5≈1×T=1; full Muse graph may prefer default).
+
+Optional: program_uop via Tensor.custom_kernel when FUSED_KQUANT_GEMV=1
+(deprecated escape hatch; default off; T=1 only).
+
+Launch geometry knobs (KQUANT_NSG / KQUANT_NR0_*) are tuning-only.
 """
 from __future__ import annotations
 from typing import cast
@@ -14,8 +21,13 @@ from tinygrad.uop.ops import UOp, Ops, KernelInfo, ProgramInfo, ParamArg, AxisTy
 
 _Q4_K, _Q5_K, _Q6_K = 12, 13, 14
 _QK_K = 256
-_NSG = getenv("KQUANT_NSG", 2)
+# Tuning-only launch geometry (defaults = zero-ritual PR path).
+# NSG = Metal simdgroups / threadgroup (default 1; NSG=2 is ~3% slower on Muse).
+# NR0 = output rows per subgroup (Q4=2, Q5=1, Q6=2).
+_NSG = getenv("KQUANT_NSG", 1)
 _NR0 = {_Q4_K: getenv("KQUANT_NR0_Q4", 2), _Q5_K: getenv("KQUANT_NR0_Q5", 1), _Q6_K: getenv("KQUANT_NR0_Q6", 2)}
+# Small-T packed path (DFlash verify); large prefill stays dequant+GEMM.
+_MAX_T = getenv("QUANT_GEMV_MAX_T", 16)
 
 
 _BLOCK = {
@@ -47,7 +59,7 @@ def _rows_per_tg(ggml_type: int) -> int: return _NSG * _nr0(ggml_type)
 def _ycast(expr: str, x_half: bool) -> str:
   return f"float({expr})" if x_half else expr
 
-def _metal_src_q4(N: int, nblk: int, x_half: bool, out_half: bool) -> str:
+def _metal_src_q4(N: int, nblk: int, T: int, x_half: bool, out_half: bool) -> str:
   x_ty = "half" if x_half else "float"
   out_ty = "half" if out_half else "float"
   def y(e: str) -> str: return _ycast(e, x_half)
@@ -61,7 +73,7 @@ kernel void kquant_gemv(
   ushort tiisg [[thread_index_in_simdgroup]],
   ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {{
-  constexpr uint N = {N}u, nblk = {nblk}u, NSG = {_NSG}u, NR0 = {_nr0(_Q4_K)}u;
+  constexpr uint N = {N}u, nblk = {nblk}u, T = {T}u, NSG = {_NSG}u, NR0 = {_nr0(_Q4_K)}u;
   constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
   const short ix = tiisg / 8;
   const short it = tiisg % 8;
@@ -69,6 +81,10 @@ kernel void kquant_gemv(
   const short ir = it % 4;
   const uint first_row = (tgpig.x * NSG + sgitg) * NR0;
   if (first_row >= N) return;
+  const uint col = tgpig.y;
+  if (col >= T) return;
+  const uint xoff = col * nblk * 256u;
+  const uint ooff = col * N;
   float yl[16], yh[16];
   float sumf[4] = {{0.f, 0.f, 0.f, 0.f}};
   uint16_t sc16[4];
@@ -77,10 +93,10 @@ kernel void kquant_gemv(
     float4 sumy = {{0.f, 0.f, 0.f, 0.f}};
     const uint base = ib * 256u + 64u * iq + 8u * ir;
     for (short i = 0; i < 8; ++i) {{
-      yl[i+0] = {y('data1[base + i + 0]')}; sumy[0] += yl[i+0];
-      yl[i+8] = {y('data1[base + i + 32]')}; sumy[1] += yl[i+8];
-      yh[i+0] = {y('data1[base + i + 128]')}; sumy[2] += yh[i+0];
-      yh[i+8] = {y('data1[base + i + 160]')}; sumy[3] += yh[i+8];
+      yl[i+0] = {y('data1[xoff + base + i + 0]')}; sumy[0] += yl[i+0];
+      yl[i+8] = {y('data1[xoff + base + i + 32]')}; sumy[1] += yl[i+8];
+      yh[i+0] = {y('data1[xoff + base + i + 128]')}; sumy[2] += yh[i+0];
+      yh[i+8] = {y('data1[xoff + base + i + 160]')}; sumy[3] += yh[i+8];
     }}
     for (uint r = 0; r < NR0; r++) {{
       const uint row = first_row + r;
@@ -118,13 +134,13 @@ kernel void kquant_gemv(
     const uint row = first_row + r;
     if (row >= N) break;
     float t = simd_sum(sumf[r]);
-    if (tiisg == 0) data0[row] = {out_ty}(t);
+    if (tiisg == 0) data0[ooff + row] = {out_ty}(t);
   }}
 }}
 """
 
 
-def _metal_src_q5(N: int, nblk: int, x_half: bool, out_half: bool) -> str:
+def _metal_src_q5(N: int, nblk: int, T: int, x_half: bool, out_half: bool) -> str:
   """llama.cpp kernel_mul_mv_q5_K_f32_impl for contiguous decode GEMV."""
   x_ty = "half" if x_half else "float"
   out_ty = "half" if out_half else "float"
@@ -139,7 +155,7 @@ kernel void kquant_gemv(
   ushort tiisg [[thread_index_in_simdgroup]],
   ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {{
-  constexpr uint N = {N}u, nblk = {nblk}u, NSG = {_NSG}u, NR0 = {_nr0(_Q5_K)}u;
+  constexpr uint N = {N}u, nblk = {nblk}u, T = {T}u, NSG = {_NSG}u, NR0 = {_nr0(_Q5_K)}u;
   constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
   const short tid = tiisg / 4;
   const short ix = tiisg % 4;
@@ -154,6 +170,10 @@ kernel void kquant_gemv(
   const uint8_t hm4 = hm2 << 4;
   const uint first_row = (tgpig.x * NSG + sgitg) * NR0;
   if (first_row >= N) return;
+  const uint col = tgpig.y;
+  if (col >= T) return;
+  const uint xoff = col * nblk * 256u;
+  const uint ooff = col * N;
   float yl[16], yh[16];
   float sumf[4] = {{0.f, 0.f, 0.f, 0.f}};
   uint16_t sc16[4];
@@ -162,10 +182,10 @@ kernel void kquant_gemv(
     float4 sumy = {{0.f, 0.f, 0.f, 0.f}};
     const uint y1 = ib * 256u + y_offset;
     for (short l = 0; l < 8; ++l) {{
-      yl[l+0] = {y('data1[y1 + l + 0]')}; sumy[0] += yl[l+0];
-      yl[l+8] = {y('data1[y1 + l + 32]')}; sumy[1] += yl[l+8];
-      yh[l+0] = {y('data1[y1 + l + 128]')}; sumy[2] += yh[l+0];
-      yh[l+8] = {y('data1[y1 + l + 160]')}; sumy[3] += yh[l+8];
+      yl[l+0] = {y('data1[xoff + y1 + l + 0]')}; sumy[0] += yl[l+0];
+      yl[l+8] = {y('data1[xoff + y1 + l + 32]')}; sumy[1] += yl[l+8];
+      yh[l+0] = {y('data1[xoff + y1 + l + 128]')}; sumy[2] += yh[l+0];
+      yh[l+8] = {y('data1[xoff + y1 + l + 160]')}; sumy[3] += yh[l+8];
     }}
     for (uint r = 0; r < NR0; r++) {{
       const uint row = first_row + r;
@@ -205,12 +225,12 @@ kernel void kquant_gemv(
     const uint row = first_row + r;
     if (row >= N) break;
     float t = simd_sum(sumf[r]);
-    if (tiisg == 0) data0[row] = {out_ty}(t);
+    if (tiisg == 0) data0[ooff + row] = {out_ty}(t);
   }}
 }}
 """
 
-def _metal_src_q6(N: int, nblk: int, x_half: bool, out_half: bool) -> str:
+def _metal_src_q6(N: int, nblk: int, T: int, x_half: bool, out_half: bool) -> str:
   """llama.cpp kernel_mul_mv_q6_K_f32_impl for contiguous decode GEMV."""
   x_ty = "half" if x_half else "float"
   out_ty = "half" if out_half else "float"
@@ -225,10 +245,14 @@ kernel void kquant_gemv(
   ushort tiisg [[thread_index_in_simdgroup]],
   ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {{
-  constexpr uint N = {N}u, nblk = {nblk}u, NSG = {_NSG}u, NR0 = {_nr0(_Q6_K)}u;
+  constexpr uint N = {N}u, nblk = {nblk}u, T = {T}u, NSG = {_NSG}u, NR0 = {_nr0(_Q6_K)}u;
   constexpr uint8_t kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
   const uint first_row = (tgpig.x * NSG + sgitg) * NR0;
   if (first_row >= N) return;
+  const uint col = tgpig.y;
+  if (col >= T) return;
+  const uint xoff = col * nblk * 256u;
+  const uint ooff = col * N;
   const short tid = tiisg / 2;
   const short ix = tiisg % 2;
   const short ip = tid / 8;
@@ -243,10 +267,10 @@ kernel void kquant_gemv(
   for (uint ib = ix; ib < nblk; ib += 2u) {{
     for (short l = 0; l < 4; ++l) {{
       const uint yb = ib * 256u + y_offset;
-      yl[4*l + 0] = {y('data1[yb + l + 0]')};
-      yl[4*l + 1] = {y('data1[yb + l + 32]')};
-      yl[4*l + 2] = {y('data1[yb + l + 64]')};
-      yl[4*l + 3] = {y('data1[yb + l + 96]')};
+      yl[4*l + 0] = {y('data1[xoff + yb + l + 0]')};
+      yl[4*l + 1] = {y('data1[xoff + yb + l + 32]')};
+      yl[4*l + 2] = {y('data1[xoff + yb + l + 64]')};
+      yl[4*l + 3] = {y('data1[xoff + yb + l + 96]')};
     }}
     for (uint r = 0; r < NR0; r++) {{
       const uint row = first_row + r;
@@ -271,13 +295,13 @@ kernel void kquant_gemv(
     const uint row = first_row + r;
     if (row >= N) break;
     float t = simd_sum(sumf[r]);
-    if (tiisg == 0) data0[row] = {out_ty}(t);
+    if (tiisg == 0) data0[ooff + row] = {out_ty}(t);
   }}
 }}
 """
 
 def _x_load(x_half: bool) -> str:
-  return "\n".join(f"    float xv{g} = {_ycast(f'data1[ib*256 + {g}*32 + it]', x_half)};" for g in range(8))
+  return "\n".join(f"    float xv{g} = {_ycast(f'data1[xoff + ib*256 + {g}*32 + it]', x_half)};" for g in range(8))
 
 def _body_q5() -> str:
   return f"""
@@ -327,7 +351,7 @@ def _body_q6() -> str:
 
 _BODY = {_Q5_K: _body_q5, _Q6_K: _body_q6}
 
-def _metal_src_generic(ggml_type: int, N: int, nblk: int, x_half: bool, out_half: bool) -> str:
+def _metal_src_generic(ggml_type: int, N: int, nblk: int, T: int, x_half: bool, out_half: bool) -> str:
   x_ty = "half" if x_half else "float"
   out_ty = "half" if out_half else "float"
   return f"""
@@ -340,9 +364,13 @@ kernel void kquant_gemv(
   ushort tiisg [[thread_index_in_simdgroup]],
   ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {{
-  constexpr uint N = {N}u, nblk = {nblk}u, NSG = {_NSG}u, NR0 = {_nr0(ggml_type)}u;
+  constexpr uint N = {N}u, nblk = {nblk}u, T = {T}u, NSG = {_NSG}u, NR0 = {_nr0(ggml_type)}u;
   const uint first_row = (tgpig.x * NSG + sgitg) * NR0;
   if (first_row >= N) return;
+  const uint col = tgpig.y;
+  if (col >= T) return;
+  const uint xoff = col * nblk * 256u;
+  const uint ooff = col * N;
   const short it = tiisg;
   float sumf[4] = {{0.f, 0.f, 0.f, 0.f}};
   for (uint ib = 0; ib < nblk; ib++) {{
@@ -358,24 +386,263 @@ kernel void kquant_gemv(
     const uint row = first_row + r;
     if (row >= N) break;
     float t = simd_sum(sumf[r]);
-    if (tiisg == 0) data0[row] = {out_ty}(t);
+    if (tiisg == 0) data0[ooff + row] = {out_ty}(t);
   }}
 }}
 """
 
-def _metal_src(ggml_type: int, N: int, nblk: int, x_half: bool, out_half: bool) -> str:
-  if ggml_type == _Q4_K: return _metal_src_q4(N, nblk, x_half, out_half)
-  if ggml_type == _Q5_K: return _metal_src_q5(N, nblk, x_half, out_half)
-  if ggml_type == _Q6_K: return _metal_src_q6(N, nblk, x_half, out_half)
-  return _metal_src_generic(ggml_type, N, nblk, x_half, out_half)
+
+def _metal_src_q4_ws(N: int, nblk: int, T: int, x_half: bool, out_half: bool) -> str:
+  """Weight-stationary Q4_K: one row/TG, cache quant payload, accumulate all T."""
+  x_ty = "half" if x_half else "float"
+  out_ty = "half" if out_half else "float"
+  def y(e: str) -> str: return _ycast(e, x_half)
+  return f"""
+#include <metal_stdlib>
+using namespace metal;
+{_BLOCK[_Q4_K]}
+kernel void kquant_gemv(
+  device {out_ty}* data0, const device {x_ty}* data1, const device block_q4_K* data2,
+  uint3 tgpig [[threadgroup_position_in_grid]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {{
+  constexpr uint N = {N}u, nblk = {nblk}u, T = {T}u;
+  constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+  const short ix = tiisg / 8;
+  const short it = tiisg % 8;
+  const short iq = it / 4;
+  const short ir = it % 4;
+  const uint row = tgpig.x;
+  if (row >= N) return;
+  float yl[16], yh[16];
+  float sumf[T];
+  for (uint c = 0; c < T; c++) sumf[c] = 0.f;
+  uint16_t sc16[4];
+  thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+  for (uint ib = ix; ib < nblk; ib += 4u) {{
+    device const block_q4_K& blk = data2[row * nblk + ib];
+    device const uint16_t* sc = (device const uint16_t*)blk.scales + iq;
+    device const uint16_t* q1p = (device const uint16_t*)blk.qs + 16 * iq + 4 * ir;
+    device const uint16_t* q2p = q1p + 32;
+    const float d = float(blk.d), dmin = float(blk.dmin);
+    sc16[0] = sc[0] & kmask1;
+    sc16[1] = sc[2] & kmask1;
+    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+    uint16_t q1c[4], q2c[4];
+    for (short i = 0; i < 4; ++i) {{ q1c[i] = q1p[i]; q2c[i] = q2p[i]; }}
+    for (uint col = 0; col < T; col++) {{
+      const uint xoff = col * nblk * 256u;
+      float4 sumy = {{0.f, 0.f, 0.f, 0.f}};
+      const uint base = ib * 256u + 64u * iq + 8u * ir;
+      for (short i = 0; i < 8; ++i) {{
+        yl[i+0] = {y('data1[xoff + base + i + 0]')}; sumy[0] += yl[i+0];
+        yl[i+8] = {y('data1[xoff + base + i + 32]')}; sumy[1] += yl[i+8];
+        yh[i+0] = {y('data1[xoff + base + i + 128]')}; sumy[2] += yh[i+0];
+        yh[i+8] = {y('data1[xoff + base + i + 160]')}; sumy[3] += yh[i+8];
+      }}
+      float4 acc1 = {{0.f, 0.f, 0.f, 0.f}};
+      float4 acc2 = {{0.f, 0.f, 0.f, 0.f}};
+      for (short i = 0; i < 4; ++i) {{
+        acc1[0] += yl[2*i + 0] * float(q1c[i] & 0x000F);
+        acc1[1] += yl[2*i + 1] * float(q1c[i] & 0x0F00);
+        acc1[2] += yl[2*i + 8] * float(q1c[i] & 0x00F0);
+        acc1[3] += yl[2*i + 9] * float(q1c[i] & 0xF000);
+        acc2[0] += yh[2*i + 0] * float(q2c[i] & 0x000F);
+        acc2[1] += yh[2*i + 1] * float(q2c[i] & 0x0F00);
+        acc2[2] += yh[2*i + 8] * float(q2c[i] & 0x00F0);
+        acc2[3] += yh[2*i + 9] * float(q2c[i] & 0xF000);
+      }}
+      sumf[col] += d * ((acc1[0] + (1.f/256.f) * acc1[1]) * float(sc8[0]) +
+                      (acc1[2] + (1.f/256.f) * acc1[3]) * float(sc8[1]) * (1.f/16.f) +
+                      (acc2[0] + (1.f/256.f) * acc2[1]) * float(sc8[4]) +
+                      (acc2[2] + (1.f/256.f) * acc2[3]) * float(sc8[5]) * (1.f/16.f))
+               - dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                         sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+    }}
+  }}
+  for (uint col = 0; col < T; col++) {{
+    float t = simd_sum(sumf[col]);
+    if (tiisg == 0) data0[col * N + row] = {out_ty}(t);
+  }}
+}}
+"""
+
+
+def _metal_src_q5_ws(N: int, nblk: int, T: int, x_half: bool, out_half: bool) -> str:
+  """Weight-stationary Q5_K: one row/TG."""
+  x_ty = "half" if x_half else "float"
+  out_ty = "half" if out_half else "float"
+  def y(e: str) -> str: return _ycast(e, x_half)
+  return f"""
+#include <metal_stdlib>
+using namespace metal;
+{_BLOCK[_Q5_K]}
+kernel void kquant_gemv(
+  device {out_ty}* data0, const device {x_ty}* data1, const device block_q5_K* data2,
+  uint3 tgpig [[threadgroup_position_in_grid]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {{
+  constexpr uint N = {N}u, nblk = {nblk}u, T = {T}u;
+  constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+  const short tid = tiisg / 4;
+  const short ix = tiisg % 4;
+  const short iq = tid / 4;
+  const short ir = tid % 4;
+  const short l0 = 8 * ir;
+  const short q_offset = 32 * iq + l0;
+  const short y_offset = 64 * iq + l0;
+  const uint8_t hm1 = 1u << (2 * iq);
+  const uint8_t hm2 = hm1 << 1;
+  const uint8_t hm3 = hm1 << 4;
+  const uint8_t hm4 = hm2 << 4;
+  const uint row = tgpig.x;
+  if (row >= N) return;
+  float yl[16], yh[16];
+  float sumf[T];
+  for (uint c = 0; c < T; c++) sumf[c] = 0.f;
+  uint16_t sc16[4];
+  thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+  for (uint ib = ix; ib < nblk; ib += 4u) {{
+    device const block_q5_K& blk = data2[row * nblk + ib];
+    device const uint8_t* q1p = blk.qs + q_offset;
+    device const uint8_t* q2p = q1p + 64;
+    device const uint8_t* qhp = blk.qh + l0;
+    device const uint16_t* a = (device const uint16_t*)blk.scales + iq;
+    const float d = float(blk.d), dmin = float(blk.dmin);
+    sc16[0] = a[0] & kmask1;
+    sc16[1] = a[2] & kmask1;
+    sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+    sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+    uint8_t q1c[8], q2c[8], qhc[8];
+    for (short l = 0; l < 8; ++l) {{ q1c[l] = q1p[l]; q2c[l] = q2p[l]; qhc[l] = qhp[l]; }}
+    for (uint col = 0; col < T; col++) {{
+      const uint xoff = col * nblk * 256u;
+      float4 sumy = {{0.f, 0.f, 0.f, 0.f}};
+      const uint y1 = ib * 256u + y_offset;
+      for (short l = 0; l < 8; ++l) {{
+        yl[l+0] = {y('data1[xoff + y1 + l + 0]')}; sumy[0] += yl[l+0];
+        yl[l+8] = {y('data1[xoff + y1 + l + 32]')}; sumy[1] += yl[l+8];
+        yh[l+0] = {y('data1[xoff + y1 + l + 128]')}; sumy[2] += yh[l+0];
+        yh[l+8] = {y('data1[xoff + y1 + l + 160]')}; sumy[3] += yh[l+8];
+      }}
+      float4 acc1 = {{0.f, 0.f, 0.f, 0.f}};
+      float4 acc2 = {{0.f, 0.f, 0.f, 0.f}};
+      for (short l = 0; l < 8; ++l) {{
+        const uint8_t h = qhc[l];
+        acc1[0] += yl[l+0] * float(q1c[l] & 0x0F);
+        acc1[1] += yl[l+8] * float(q1c[l] & 0xF0);
+        acc1[2] += yh[l+0] * float(q2c[l] & 0x0F);
+        acc1[3] += yh[l+8] * float(q2c[l] & 0xF0);
+        acc2[0] += (h & hm1) ? yl[l+0] : 0.f;
+        acc2[1] += (h & hm2) ? yl[l+8] : 0.f;
+        acc2[2] += (h & hm3) ? yh[l+0] : 0.f;
+        acc2[3] += (h & hm4) ? yh[l+8] : 0.f;
+      }}
+      sumf[col] += d * (float(sc8[0]) * (acc1[0] + 16.f * acc2[0]) +
+                      float(sc8[1]) * (acc1[1] * (1.f/16.f) + 16.f * acc2[1]) +
+                      float(sc8[4]) * (acc1[2] + 16.f * acc2[2]) +
+                      float(sc8[5]) * (acc1[3] * (1.f/16.f) + 16.f * acc2[3]))
+               - dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                         sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+    }}
+  }}
+  for (uint col = 0; col < T; col++) {{
+    float t = simd_sum(sumf[col]);
+    if (tiisg == 0) data0[col * N + row] = {out_ty}(t);
+  }}
+}}
+"""
+
+
+def _metal_src_q6_ws(N: int, nblk: int, T: int, x_half: bool, out_half: bool) -> str:
+  """Weight-stationary Q6_K: one row/TG."""
+  x_ty = "half" if x_half else "float"
+  out_ty = "half" if out_half else "float"
+  def y(e: str) -> str: return _ycast(e, x_half)
+  return f"""
+#include <metal_stdlib>
+using namespace metal;
+{_BLOCK[_Q6_K]}
+kernel void kquant_gemv(
+  device {out_ty}* data0, const device {x_ty}* data1, const device block_q6_K* data2,
+  uint3 tgpig [[threadgroup_position_in_grid]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {{
+  constexpr uint N = {N}u, nblk = {nblk}u, T = {T}u;
+  constexpr uint8_t kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
+  const uint row = tgpig.x;
+  if (row >= N) return;
+  const short tid = tiisg / 2;
+  const short ix = tiisg % 2;
+  const short ip = tid / 8;
+  const short il = tid % 8;
+  const short l0 = 4 * il;
+  const short is = 8 * ip + l0 / 16;
+  const short y_offset = 128 * ip + l0;
+  const short q_offset_l = 64 * ip + l0;
+  const short q_offset_h = 32 * ip + l0;
+  float sumf[T];
+  for (uint c = 0; c < T; c++) sumf[c] = 0.f;
+  float yl[16];
+  for (uint ib = ix; ib < nblk; ib += 2u) {{
+    device const block_q6_K& blk = data2[row * nblk + ib];
+    device const uint8_t* q1p = blk.ql + q_offset_l;
+    device const uint8_t* q2p = q1p + 32;
+    device const uint8_t* qhp = blk.qh + q_offset_h;
+    device const int8_t* scp = blk.scales + is;
+    const float d = float(blk.d);
+    const int8_t sc0 = scp[0], sc2 = scp[2], sc4 = scp[4], sc6 = scp[6];
+    uint8_t q1c[4], q2c[4], qhc[4];
+    for (short l = 0; l < 4; ++l) {{ q1c[l] = q1p[l]; q2c[l] = q2p[l]; qhc[l] = qhp[l]; }}
+    for (uint col = 0; col < T; col++) {{
+      const uint xoff = col * nblk * 256u;
+      for (short l = 0; l < 4; ++l) {{
+        const uint yb = ib * 256u + y_offset;
+        yl[4*l + 0] = {y('data1[xoff + yb + l + 0]')};
+        yl[4*l + 1] = {y('data1[xoff + yb + l + 32]')};
+        yl[4*l + 2] = {y('data1[xoff + yb + l + 64]')};
+        yl[4*l + 3] = {y('data1[xoff + yb + l + 96]')};
+      }}
+      float4 sums = {{0.f, 0.f, 0.f, 0.f}};
+      for (short l = 0; l < 4; ++l) {{
+        sums[0] += yl[4*l + 0] * float((int8_t)((q1c[l] & 0xF) | ((qhc[l] & kmask1) << 4)) - 32);
+        sums[1] += yl[4*l + 1] * float((int8_t)((q2c[l] & 0xF) | ((qhc[l] & kmask2) << 2)) - 32);
+        sums[2] += yl[4*l + 2] * float((int8_t)((q1c[l] >> 4) | ((qhc[l] & kmask3) << 0)) - 32);
+        sums[3] += yl[4*l + 3] * float((int8_t)((q2c[l] >> 4) | ((qhc[l] & kmask4) >> 2)) - 32);
+      }}
+      sumf[col] += d * (sums[0] * float(sc0) + sums[1] * float(sc2) + sums[2] * float(sc4) + sums[3] * float(sc6));
+    }}
+  }}
+  for (uint col = 0; col < T; col++) {{
+    float t = simd_sum(sumf[col]);
+    if (tiisg == 0) data0[col * N + row] = {out_ty}(t);
+  }}
+}}
+"""
+
+
+def _metal_src(ggml_type: int, N: int, nblk: int, T: int, x_half: bool, out_half: bool) -> str:
+  if T > 1 and getenv("QUANT_GEMV_WS", 0):
+    if ggml_type == _Q4_K: return _metal_src_q4_ws(N, nblk, T, x_half, out_half)
+    if ggml_type == _Q5_K: return _metal_src_q5_ws(N, nblk, T, x_half, out_half)
+    if ggml_type == _Q6_K: return _metal_src_q6_ws(N, nblk, T, x_half, out_half)
+  if ggml_type == _Q4_K: return _metal_src_q4(N, nblk, T, x_half, out_half)
+  if ggml_type == _Q5_K: return _metal_src_q5(N, nblk, T, x_half, out_half)
+  if ggml_type == _Q6_K: return _metal_src_q6(N, nblk, T, x_half, out_half)
+  return _metal_src_generic(ggml_type, N, nblk, T, x_half, out_half)
 
 @functools.cache
-def _compiled_lib(ggml_type: int, N: int, nblk: int, nsg: int, nr0: int, x_half: bool, out_half: bool) -> bytes:
+def _compiled_lib(ggml_type: int, N: int, nblk: int, T: int, nsg: int, nr0: int, x_half: bool, out_half: bool, ws: int = 0) -> bytes:
   from tinygrad.runtime.ops_metal import MetalCompiler
-  return MetalCompiler().compile(_metal_src(ggml_type, N, nblk, x_half, out_half))
+  return MetalCompiler().compile(_metal_src(ggml_type, N, nblk, T, x_half, out_half))
 
 def _program(out: UOp, x: UOp, qweight: UOp, *, ggml_type: int, N: int, K: int, x_half: bool, out_half: bool) -> UOp:
-  nblk, rpt = K // _QK_K, _rows_per_tg(ggml_type)
+  """FUSED_KQUANT_GEMV escape hatch — T=1 only."""
+  nblk, rpt, T = K // _QK_K, _rows_per_tg(ggml_type), 1
   out_f, x_f, qw_f = out.flatten(), x.flatten(), qweight.flatten()
   gidx0 = UOp.special((N + rpt - 1) // rpt, "gidx0")
   lidx0 = UOp.special(32 * _NSG, "lidx0")
@@ -383,19 +650,23 @@ def _program(out: UOp, x: UOp, qweight: UOp, *, ggml_type: int, N: int, K: int, 
   store = out_f[i].store(x_f[i % K].load().cast(dtypes.float32) * 0.0 + qw_f[0].load().cast(dtypes.float32) * 0.0)
   sink = UOp.sink(store, gidx0, lidx0, arg=KernelInfo(name="kquant_gemv", opts_to_apply=()))
   pi = ProgramInfo(name="kquant_gemv",
-                   global_size=((N + rpt - 1) // rpt, 1, 1),
+                   global_size=((N + rpt - 1) // rpt, T, 1),
                    local_size=(32 * _NSG, 1, 1),
                    globals=(0, 1, 2), outs=(0,), ins=(1, 2), target=Target("METAL"))
-  src = _metal_src(ggml_type, N, nblk, x_half, out_half)
-  lib = _compiled_lib(ggml_type, N, nblk, _NSG, _nr0(ggml_type), x_half, out_half)
+  src = _metal_src(ggml_type, N, nblk, T, x_half, out_half)
+  lib = _compiled_lib(ggml_type, N, nblk, T, _NSG, _nr0(ggml_type), x_half, out_half)
   return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=()), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=lib)), arg=pi)
 
 program_uop = _program
 
 _BLOCK_BYTES = {_Q4_K: 144, _Q5_K: 176, _Q6_K: 210}
 
-def _match_packed_gemv(ast: UOp) -> tuple[int, int, int, int, int, int, bool, bool] | None:
-  """Isolated k-quant decode GEMV: 3 bufs, 1 REDUCE, concrete N/K, nbytes match."""
+def _match_packed_gemv(ast: UOp) -> tuple[int, int, int, int, int, int, int, bool, bool] | None:
+  """Isolated k-quant GEMV/small-GEMM: 3 bufs, 1 REDUCE, concrete N/K/T, nbytes match.
+
+  T=1 decode: one WEAK range (N). T>1 verify: WEAK ranges whose product is T*N;
+  N is recovered from packed uchar nbytes so T = out_elems // N.
+  """
   if ast.op is not Ops.SINK: return None
   nodes = list(ast.toposort())
   reduces = [u for u in nodes if u.op is Ops.REDUCE and u.arg[0] is Ops.ADD]
@@ -418,7 +689,7 @@ def _match_packed_gemv(ast: UOp) -> tuple[int, int, int, int, int, int, bool, bo
     weak = [u for u in stores[0].toposort()
             if u.op is Ops.RANGE and u.arg[1] == AxisType.WEAK and u is not red_ranges[0]]
   if not weak: return None
-  try: N = int(prod(int(cast(int, r.src[0].ssimplify())) for r in weak))
+  try: out_elems = int(prod(int(cast(int, r.src[0].ssimplify())) for r in weak))
   except Exception: return None
 
   params = [u for u in nodes if u.op is Ops.PARAM and isinstance(u.arg, ParamArg) and u.dtype.itemsize > 0]
@@ -426,28 +697,48 @@ def _match_packed_gemv(ast: UOp) -> tuple[int, int, int, int, int, int, bool, bo
   uchar = [p for p in params if p.dtype == dtypes.uchar]
   if len(uchar) != 1: return None
   qw_slot, qw_bytes = uchar[0].arg.slot, int(cast(int, uchar[0].src[0].ssimplify()))
-  ggml_type = next((gt for gt, bb in _BLOCK_BYTES.items() if qw_bytes == N * nblk * bb), None)
-  if ggml_type is None: return None
+  # Factor out_elems = T * N with N from packed nbytes (not from WEAK prod alone).
+  match = None
+  for gt, bb in _BLOCK_BYTES.items():
+    unit = nblk * bb
+    if unit <= 0 or qw_bytes % unit: continue
+    N = qw_bytes // unit
+    if N < 1 or out_elems % N: continue
+    T = out_elems // N
+    if T < 1 or T > getenv("QUANT_GEMV_MAX_T", 16): continue
+    match = (gt, N, T)
+    break
+  if match is None: return None
+  ggml_type, N, T = match
 
-  # allow oversized reused buffers; ranges define N/K
+  # allow oversized reused buffers; ranges define N/K/T
   x_cands = [p for p in params if p.arg.slot not in (out_p.arg.slot, qw_slot) and p.dtype.itemsize in (2, 4)]
   if len(x_cands) != 1: return None
   if not any(u.op is Ops.BITCAST for u in nodes): return None
   if not any(u.op in (Ops.AND, Ops.SHR) for u in nodes): return None
   x_p = x_cands[0]
-  return (ggml_type, N, K, out_p.arg.slot, x_p.arg.slot, qw_slot,
+  try:
+    if int(cast(int, x_p.src[0].ssimplify())) < T * K: return None
+  except Exception: return None
+  return (ggml_type, N, K, T, out_p.arg.slot, x_p.arg.slot, qw_slot,
           x_p.dtype.itemsize == 2 and bool(getenv("KQUANT_X_HALF", 1)), out_p.dtype.itemsize == 2)
 
 def try_packed_kquant_gemv(ast: UOp, renderer: Renderer) -> UOp | None:
   if not getenv("QUANT_GEMV_LOWER", 1) or not isinstance(renderer, MetalRenderer): return None
   if (m := _match_packed_gemv(ast)) is None: return None
-  ggml_type, N, K, out_slot, x_slot, qw_slot, x_half, out_half = m
-  nblk, rpt = K // _QK_K, _rows_per_tg(ggml_type)
+  ggml_type, N, K, T, out_slot, x_slot, qw_slot, x_half, out_half = m
+  nblk = K // _QK_K
+  ws = int(getenv("QUANT_GEMV_WS", 0)) if T > 1 else 0
+  if ws:
+    gsz, lsz = (N, 1, 1), (32, 1, 1)  # weight-stationary: T cols in-kernel
+  else:
+    rpt = _rows_per_tg(ggml_type)
+    gsz, lsz = ((N + rpt - 1) // rpt, T, 1), (32 * _NSG, 1, 1)
   pi = ProgramInfo(name="kquant_gemv",
-                   global_size=((N + rpt - 1) // rpt, 1, 1), local_size=(32 * _NSG, 1, 1),
+                   global_size=gsz, local_size=lsz,
                    globals=(out_slot, x_slot, qw_slot), outs=(out_slot,), ins=(x_slot, qw_slot),
                    target=renderer.target)
-  src = _metal_src(ggml_type, N, nblk, x_half, out_half)
-  lib = _compiled_lib(ggml_type, N, nblk, _NSG, _nr0(ggml_type), x_half, out_half)
+  src = _metal_src(ggml_type, N, nblk, T, x_half, out_half)
+  lib = _compiled_lib(ggml_type, N, nblk, T, _NSG, _nr0(ggml_type), x_half, out_half, ws)
   return UOp(Ops.PROGRAM, src=(ast, UOp(Ops.LINEAR, src=()), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=lib)), arg=pi)
 
