@@ -1,6 +1,7 @@
 """Packed ggml k-quant GEMV for Metal (llama.cpp mul_mv).
 
-Called from llm.quant.mul_mat via Tensor.custom_kernel / program_uop.
+Primary entry: try_packed_kquant_gemv from do_to_program (QUANT_GEMV_LOWER).
+Optional: program_uop via Tensor.custom_kernel when FUSED_KQUANT_GEMV=1.
 """
 from __future__ import annotations
 from typing import cast

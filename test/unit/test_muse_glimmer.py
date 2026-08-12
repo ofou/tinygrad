@@ -301,7 +301,7 @@ class TestQuantGeneral(unittest.TestCase):
 
 
 class TestQuantGemvLower(unittest.TestCase):
-  """Isolated fuse graph lowers to the same Metal kernel as custom_kernel."""
+  """Codegen lowering matches custom_kernel; sibling QuantLinears stay single-uchar."""
 
   @unittest.skipUnless(__import__("tinygrad", fromlist=["Device"]).Device.DEFAULT.upper().startswith("METAL"), "Metal only")
   def test_lower_matches_hand_q4k(self):
@@ -309,8 +309,8 @@ class TestQuantGemvLower(unittest.TestCase):
     from tinygrad.codegen import to_program_cache
     N, K, gt = 64, 256, 12
     rng = np.random.default_rng(0)
-    packed = Tensor(_pack_q4k(N, K, rng))
-    x = Tensor(rng.standard_normal((1, K)).astype(np.float16))
+    packed = Tensor(_pack_q4k(N, K, rng)).contiguous().realize()
+    x = Tensor(rng.standard_normal((1, K)).astype(np.float16)).contiguous().realize()
     def run(fused):
       os.environ["FUSED_KQUANT_GEMV"] = str(int(fused))
       os.environ["QUANT_GEMV_LOWER"] = "1"
@@ -322,6 +322,33 @@ class TestQuantGemvLower(unittest.TestCase):
       ql.qweight = packed
       return ql(x).realize().numpy().astype(np.float32)
     np.testing.assert_array_equal(run(False), run(True))
+
+  @unittest.skipUnless(__import__("tinygrad", fromlist=["Device"]).Device.DEFAULT.upper().startswith("METAL"), "Metal only")
+  def test_sibling_quantlinears_lower(self):
+    """Two QuantLinears on one x must not fuse into a multi-uchar sink."""
+    from tinygrad.helpers import getenv
+    from tinygrad.codegen import to_program_cache
+    N, K, gt = 64, 256, 12
+    rng = np.random.default_rng(0)
+    p1 = Tensor(_pack_q4k(N, K, rng)).contiguous().realize()
+    p2 = Tensor(_pack_q4k(N, K, rng)).contiguous().realize()
+    x = Tensor(rng.standard_normal((1, K)).astype(np.float16)).contiguous().realize()
+    os.environ["FUSED_KQUANT_GEMV"] = "0"
+    os.environ["QUANT_GEMV_LOWER"] = "1"
+    os.environ["HALF"] = "1"
+    os.environ["KQUANT_X_HALF"] = "1"
+    getenv.cache_clear()
+    to_program_cache.clear()
+    ql1, ql2 = QuantLinear(K, N, gt), QuantLinear(K, N, gt)
+    ql1.qweight, ql2.qweight = p1, p2
+    y_lower = (ql1(x) + ql2(x)).realize().numpy().astype(np.float32)
+    os.environ["FUSED_KQUANT_GEMV"] = "1"
+    getenv.cache_clear()
+    to_program_cache.clear()
+    ql1, ql2 = QuantLinear(K, N, gt), QuantLinear(K, N, gt)
+    ql1.qweight, ql2.qweight = p1, p2
+    y_hand = (ql1(x) + ql2(x)).realize().numpy().astype(np.float32)
+    np.testing.assert_array_equal(y_lower, y_hand)
 
 if __name__ == "__main__":
   unittest.main()

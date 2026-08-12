@@ -1,8 +1,9 @@
 """Packed GGUF quantized linears.
 
-mul_mat is ggml-shaped (y = x @ W.T). On Metal decode, k-quants bind packed mul_mv
-(tinygrad.codegen.quant_gemv) via custom_kernel. Otherwise ggml_data_to_tensor fuses
-into linear; do_to_program also lowers isolated 3-buf uchar+REDUCE sinks when matched.
+mul_mat is ggml-shaped (y = x @ W.T). On Metal decode, k-quant GEMVs lower in
+do_to_program (QUANT_GEMV_LOWER) from the fused dequant+linear sink. Sibling
+QuantLinears are split with .contiguous() so each sink stays single-uchar.
+FUSED_KQUANT_GEMV=1 keeps Tensor.custom_kernel as an escape hatch.
 """
 from __future__ import annotations
 import functools
@@ -31,6 +32,10 @@ def _device_is_metal(x: Tensor) -> bool:
   dev = x.device if isinstance(x.device, str) else (x.device[0] if isinstance(x.device, tuple) else Device.DEFAULT)
   return str(dev).upper().startswith("METAL")
 
+def _metal_kquant_decode(x: Tensor, ggml_type: int, in_features: int) -> bool:
+  return (ggml_type in _KQUANT_TYPES and in_features % _QK_K == 0
+          and _is_decode_row(x) and _device_is_metal(x))
+
 def _mul_mat_q_metal(qweight: Tensor, x: Tensor, n: int, k: int, ggml_type: int) -> Tensor:
   from tinygrad.codegen.quant_gemv import program_uop
   if k % _QK_K: raise ValueError(f"K={k} not divisible by {_QK_K}")
@@ -45,10 +50,15 @@ def _mul_mat_q_metal(qweight: Tensor, x: Tensor, n: int, k: int, ggml_type: int)
   return out.reshape(*x.shape[:-1], n)
 
 def mul_mat(qweight: Tensor, x: Tensor, *, ggml_type: int, out_features: int, in_features: int) -> Tensor:
-  if (getenv("FUSED_KQUANT_GEMV", 1) and ggml_type in _KQUANT_TYPES and in_features % _QK_K == 0
-      and _is_decode_row(x) and _device_is_metal(x)):
+  # Escape hatch: hand-rolled Metal mul_mv via custom_kernel (default off).
+  if getenv("FUSED_KQUANT_GEMV", 0) and _metal_kquant_decode(x, ggml_type, in_features):
     return _mul_mat_q_metal(qweight, x, out_features, in_features, ggml_type)
-  return x.linear(dequant_weight(qweight, out_features, in_features, ggml_type).transpose())
+  y = x.linear(dequant_weight(qweight, out_features, in_features, ggml_type).transpose())
+  # Prevent Muse sibling QuantLinears from fusing into multi-uchar sinks that
+  # QUANT_GEMV_LOWER cannot match; each decode GEMV stays a single-uchar kernel.
+  if _metal_kquant_decode(x, ggml_type, in_features) and getenv("QUANT_GEMV_LOWER", 1):
+    return y.contiguous()
+  return y
 
 class QuantLinear:
   def __init__(self, in_features: int, out_features: int, ggml_type: int, bias: bool = False):
